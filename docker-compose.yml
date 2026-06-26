@@ -1,0 +1,21 @@
+# Initiate any benchmark or validation through docker compose - no host Python toolchain needed:
+#
+#   docker compose run --rm openbench list
+#   docker compose run --rm openbench suite    --pools ckpool,pogolo
+#   docker compose run --rm openbench bench    --pools pogolo
+#   docker compose run --rm openbench validate --pools pogolo
+#   docker compose run --rm openbench bench    --pools pogolo --pool-cpus 1-4 --bench-cpus 5-8
+
+name: open-pool-benchmark
+
+services:
+  openbench:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: open-pool-benchmark:latest
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - .:/workspace
+    working_dir: /workspace
+    entrypoint: ["openbench"]

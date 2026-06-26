@@ -1,0 +1,111 @@
+# open-pool-benchmark - the pool registry.
+#
+# This is the one file you edit to add or tune a pool. Each entry under `pools:` is an *adapter*:
+# how to obtain the pool's runtime (a published image or a local build), where its Stratum + HTTP
+# ports live inside the container, how to render its native config from a logical profile, and how
+# to tell when it's ready. The orchestrator brings up the shared regtest bitcoind below, then drives
+# each selected pool on the same docker network.
+#
+# Template variables usable in a config template or an http/tcp readiness target (filled per run):
+#   RPC_HOST RPC_PORT RPC_USER RPC_PASS  - the regtest backend below
+#   DIFFICULTY TAG                       - from the active profile
+#   ADDRESS                              - the regtest payout address below
+#   POOL_HOST API_PORT                   - the pool container's name + its API port (readiness URL)
+#   POOL_CORES                           - the pool's pinned core count ("max" if unpinned); usable
+#                                          to size worker/thread counts (also injected into env:)
+# Reference them as ${NAME} in a template, an env value, or a readiness url.
+
+# The shared regtest bitcoind every pool-under-test mines against.
+regtest:
+  rpc_user: openbench
+  rpc_pass: openbenchpass
+  rpc_port: 18443
+  bitcoind_container: bitcoind
+  network: openbench-regtest_default
+  compose_project: openbench-regtest
+  address: bcrt1qlk935ze2fsu86zjp395uvtegztrkaezawxx0wf   # regtest P2WPKH the probes authorize with
+
+pinning:
+  enabled: true
+  bitcoind_cpus: "0"
+  pool_cpus: "1"
+  bench_cpus: "2"
+
+profiles:
+  validation:
+    difficulty: 1000000
+    coinbase_tag: /openbench/
+  mine:
+    difficulty: 1
+    coinbase_tag: /openbench/
+
+pools:
+  pogolo:
+    description: 0xf0xx0/pogolo (Go solo pool)
+    source: image
+    image: 0xf0xx0/pogolo:latest
+    stratum_port: 5661
+    api_port: 5662
+    config:
+      format: toml
+      template: pools/pogolo/bench.toml
+      mount: /config/pogolo.toml
+    readiness:
+      kind: http
+      url: http://${POOL_HOST}:${API_PORT}/api/v1/info
+      status: 200
+      timeout_seconds: 40
+
+  public-pool:
+    description: benjamin-wilson/public-pool (TypeScript/Node solo pool, PM2 cluster)
+    source: build
+    build_context: ../public-pool
+    repo: https://github.com/benjamin-wilson/public-pool
+    dockerfile: pools/public-pool/Dockerfile
+    stratum_port: 3333
+    api_port: 3334
+    env:
+      NODE_ENV: production
+      PM2_INSTANCES: "${POOL_CORES}"
+    config:
+      format: env
+      template: pools/public-pool/bench.env
+      mount: /public-pool/.env
+    readiness:
+      kind: tcp
+      timeout_seconds: 150
+
+  ckpool:
+    description: ckolivas/ckpool (C solo pool, BTCSOLO mode)
+    source: build
+    build_context: pools/ckpool
+    dockerfile: Dockerfile
+    stratum_port: 3333
+    config:
+      format: json
+      template: pools/ckpool/bench.conf
+      mount: /config/ckpool.conf
+    readiness:
+      kind: tcp
+      timeout_seconds: 120
+
+  erikslund-cpp:
+    description: erikslund-solo-pool C++ pool (C++26)
+    source: build
+    build_context: ../erikslund-solo-pool/cpp
+    repo: https://github.com/eandersson/erikslund-solo-pool.git
+    repo_dir: ../erikslund-solo-pool
+    repo_ref: main
+    dockerfile: Dockerfile
+    stratum_port: 3333
+    api_port: 7777
+    config:
+      format: yaml
+      template: pools/erikslund-cpp/bench.yml
+      mount: /etc/erikslund-pool/pool.yml
+    readiness:
+      kind: http
+      url: http://${POOL_HOST}:${API_PORT}/health
+      status: 200
+      body: ok
+      timeout_seconds: 60

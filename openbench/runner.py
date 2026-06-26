@@ -1,0 +1,668 @@
+"""Orchestrate a benchmark or validation run: bring up regtest, drive each pool, report.
+
+Every subcommand follows the same arc - `session()` brings the regtest bitcoind up (and down), then
+each pool goes through `PoolUnderTest` (build/run/ready/teardown) and is driven by a probe while its
+CPU/RSS are sampled. The functions here own the *what to measure and how to report*; the lifecycle
+mechanics live in regtest.Backend and adapters.PoolUnderTest.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import dataclasses
+import json
+import logging
+import os
+import pathlib
+import re
+import shutil
+import tempfile
+from collections.abc import Iterator
+from collections.abc import Sequence
+from typing import Any
+
+import yaml
+
+from openbench import adapters
+from openbench import config
+from openbench import context
+from openbench import docker
+from openbench import regtest as regtest_module
+from openbench import report
+from openbench import results
+
+LOG = logging.getLogger(__name__)
+
+_REGTEST_COMPOSE = "regtest/docker-compose.yml"
+_SCRATCH_DIR = ".openbench"
+_PRIME_BLOCKS = 20
+_PROBE_OVERHEAD_SECONDS = 180
+_ESTABLISHED_RE = re.compile(r"ESTABLISHED \d+/\d+")
+_RESULT_LINE_RE = re.compile(r"^RESULT .*", re.MULTILINE)
+_WIDE_PORT_RANGE = ["--sysctl", "net.ipv4.ip_local_port_range=1024 65535"]
+_POOL_ERRORS = (adapters.AdapterError, docker.DockerError, KeyError, IndexError)
+_SUITE_SWEEP_CONNS = [1, 16, 64, 128]
+_SUITE_CONNSCALE_CONNS = [1000, 32000]
+_SUITE_CONN_CAP = 32000
+_SUITE_LATENCY_ROUNDS = 20
+
+
+@dataclasses.dataclass(frozen=True)
+class BenchKnobs:
+    """The load-generator knobs shared by `bench` and each point of a `sweep`."""
+
+    connections: int = 50
+    pipeline: int = 16
+    workers: int = 1
+    warmup: float = 3.0
+    duration: float = 20.0
+
+
+def _write_pinning_override(path: pathlib.Path, pinning: config.Pinning) -> None:
+    """Compose override pinning the regtest node to its cores. The pool/load/miner containers run
+    via `docker run --cpuset-cpus`, not compose, so they're pinned in adapters.PoolUnderTest."""
+    services: dict[str, dict[str, str]] = {}
+    if pinning.bitcoind_cpus:
+        services["bitcoind"] = {"cpuset": pinning.bitcoind_cpus}
+    path.write_text(yaml.safe_dump({"services": services}), encoding="utf-8")
+
+
+@contextlib.contextmanager
+def session(
+    registry: config.Registry, *, mine_maturity: bool = False, keep: bool = False
+) -> Iterator[context.RunContext]:
+    """Bring the regtest bitcoind up for the duration of a run, then tear it down."""
+    scratch_root = registry.root / _SCRATCH_DIR
+    scratch_root.mkdir(parents=True, exist_ok=True)
+    scratch = pathlib.Path(tempfile.mkdtemp(prefix="run-", dir=scratch_root))
+    files = [registry.root / _REGTEST_COMPOSE]
+    if registry.pinning.enabled:
+        override = scratch / "regtest-pinning.yml"
+        _write_pinning_override(override, registry.pinning)
+        files.append(override)
+    backend = regtest_module.Backend(registry.regtest, files, registry.regtest.compose_project)
+    run = context.RunContext(registry=registry, backend=backend, scratch=scratch)
+    try:
+        backend.up()
+        if mine_maturity:
+            backend.mine_to_maturity()
+        else:
+            backend.generate(_PRIME_BLOCKS, registry.regtest.address)
+        yield run
+    finally:
+        if not keep:
+            docker.remove(adapters.POOL_CONTAINER)
+            backend.down()
+            shutil.rmtree(scratch, ignore_errors=True)
+
+
+def _stratum_args(pool: adapters.PoolUnderTest, address: str) -> list[str]:
+    return ["--host", pool.stratum_host, "--port", str(pool.stratum_port), "--address", address]
+
+
+def _run_bench_probe(
+    pool: adapters.PoolUnderTest, address: str, knobs: BenchKnobs
+) -> dict[str, Any]:
+    """Drive the synthetic Stratum load generator while sampling CPU/RSS; return the result."""
+    args = _stratum_args(pool, address) + [
+        "--connections",
+        str(knobs.connections),
+        "--pipeline",
+        str(knobs.pipeline),
+        "--workers",
+        str(knobs.workers),
+        "--warmup",
+        str(knobs.warmup),
+        "--duration",
+        str(knobs.duration),
+    ]
+    timeout = knobs.warmup + knobs.duration + _PROBE_OVERHEAD_SECONDS
+    with pool.sampler() as sampler:
+        output = pool.run_probe("stratum_bench.py", args, timeout=timeout)
+    lines = output.strip().splitlines()
+    if not lines:
+        raise adapters.AdapterError("load generator produced no output")
+    try:
+        result: dict[str, Any] = json.loads(lines[-1])
+    except json.JSONDecodeError as exc:
+        raise adapters.AdapterError(
+            f"load generator output was not JSON: {lines[-1][:200]!r}"
+        ) from exc
+    if "validated_per_sec" not in result or "latency_ms" not in result:
+        raise adapters.AdapterError(f"load generator result missing expected keys: {result}")
+    result["cpu_pct"], result["rss_mib"] = report.parse_docker_stats(sampler.lines)
+    return result
+
+
+def _bench_pool(
+    pool: adapters.PoolUnderTest, address: str, knobs: BenchKnobs, repeat: int
+) -> dict[str, Any]:
+    """Run the load window `repeat` times against the (warm) pool and return the BEST run.
+
+    Repeating back-to-back windows against one warm pool, then taking the highest-throughput run,
+    discards windows that were dragged down by transient noise (a scheduler blip, a slow
+    connection-setup wave) - the best run is the pool's peak under this load. All reported metrics
+    (latency, cpu, rss) come from that single best run, so they stay internally consistent.
+    """
+    runs = [_run_bench_probe(pool, address, knobs) for _ in range(repeat)]
+    per_run_validated = [run["validated_per_sec"] for run in runs]
+    best = max(runs, key=lambda run: run["validated_per_sec"])
+    if repeat > 1:
+        spread = ", ".join(f"{value:.0f}" for value in per_run_validated)
+        LOG.info("  %d runs val/s: [%s] best %.0f", repeat, spread, best["validated_per_sec"])
+    return {
+        **best,
+        "runs": repeat,
+        "validated_per_sec_per_run": [round(value, 1) for value in per_run_validated],
+    }
+
+
+def _emit(headers: Sequence[str], rows: Sequence[Sequence[object]], csv_path: str | None) -> None:
+    print(report.render_table(headers, rows))
+    if csv_path:
+        report.write_csv(csv_path, headers, rows)
+        LOG.info("wrote %s", csv_path)
+
+
+def _pool_specs(registry: config.Registry, names: Sequence[str]) -> list[config.PoolSpec]:
+    return [registry.pool(name) for name in names]
+
+
+def _default_label(registry: config.Registry) -> str:
+    """A short run label for the report - the pool's core count, which is what runs vary by."""
+    pinning = registry.pinning
+    if not pinning.enabled:
+        return "unpinned"
+    return f"{config.cpuset_count(pinning.pool_cpus)}-core"
+
+
+def _persist(
+    out: str | None,
+    label: str | None,
+    kind: str,
+    registry: config.Registry,
+    profile_name: str,
+    knobs: dict[str, object] | None,
+    headers: Sequence[str],
+    rows: Sequence[Sequence[object]],
+    records: Sequence[dict[str, Any]],
+) -> None:
+    if not out:
+        return
+    payload = results.make_payload(
+        kind,
+        label=label or _default_label(registry),
+        profile=profile_name,
+        pinning=dataclasses.asdict(registry.pinning),
+        knobs=knobs,
+        columns=headers,
+        rows=rows,
+        records=records,
+    )
+    LOG.info("wrote %s", results.write_run(out, payload))
+
+
+def bench(
+    registry: config.Registry,
+    pool_names: Sequence[str],
+    profile_name: str,
+    knobs: BenchKnobs,
+    *,
+    repeat: int = 1,
+    csv_path: str | None = None,
+    json_path: str | None = None,
+    out: str | None = None,
+    label: str | None = None,
+    keep: bool = False,
+) -> int:
+    """Share-validation throughput + submit->ack latency + CPU/RSS, one row per pool.
+
+    With `repeat` > 1 each pool's row is its best (highest-throughput) of that many windows.
+    """
+    profile = registry.profile(profile_name)
+    headers = ["pool", "val/s", "p50ms", "p95ms", "p99ms", "cpu%", "rssMiB"]
+    rows: list[list[object]] = []
+    records: list[dict[str, Any]] = []
+    failed = False
+    with session(registry, keep=keep) as run:
+        for spec in _pool_specs(registry, pool_names):
+            LOG.info("benchmarking %s (%d run%s)", spec.name, repeat, "" if repeat == 1 else "s")
+            try:
+                with adapters.PoolUnderTest(run, spec, profile, keep=keep) as pool:
+                    result = _bench_pool(pool, run.address, knobs, repeat)
+                latency = result["latency_ms"]
+                rows.append(
+                    [
+                        spec.name,
+                        f"{result['validated_per_sec']:.0f}",
+                        f"{latency['p50']:.3f}",
+                        f"{latency['p95']:.3f}",
+                        f"{latency['p99']:.3f}",
+                        f"{result['cpu_pct']:.0f}",
+                        f"{result['rss_mib']:.0f}",
+                    ]
+                )
+                records.append({"pool": spec.name, "profile": profile_name, **result})
+            except _POOL_ERRORS as exc:
+                LOG.error("pool %s failed: %s", spec.name, exc)
+                rows.append([spec.name, "FAILED", "-", "-", "-", "-", "-"])
+                failed = True
+    _emit(headers, rows, csv_path)
+    if json_path:
+        pathlib.Path(json_path).write_text(json.dumps(records, indent=2), encoding="utf-8")
+        LOG.info("wrote %s", json_path)
+    _persist(
+        out,
+        label,
+        "bench",
+        registry,
+        profile_name,
+        dataclasses.asdict(knobs),
+        headers,
+        rows,
+        records,
+    )
+    return 1 if failed else 0
+
+
+def sweep(
+    registry: config.Registry,
+    pool_names: Sequence[str],
+    profile_name: str,
+    connections: Sequence[int],
+    *,
+    pipeline: int = 16,
+    workers: int = 4,
+    warmup: float = 2.0,
+    duration: float = 8.0,
+    csv_path: str | None = None,
+    out: str | None = None,
+    label: str | None = None,
+    keep: bool = False,
+) -> int:
+    """Sweep throughput over connection counts: a 1-conn latency point, then each count."""
+    profile = registry.profile(profile_name)
+    headers = [
+        "pool",
+        "connections",
+        "workers",
+        "pipeline",
+        "val/s",
+        "p50_ms",
+        "p95_ms",
+        "p99_ms",
+        "cpu_pct",
+        "rss_mib",
+    ]
+    rows: list[list[object]] = []
+    records: list[dict[str, Any]] = []
+    failed = False
+    with session(registry, keep=keep) as run:
+        for spec in _pool_specs(registry, pool_names):
+            try:
+                with adapters.PoolUnderTest(run, spec, profile, keep=keep) as pool:
+                    points = [BenchKnobs(1, 1, 1, warmup, duration)]
+                    points += [
+                        BenchKnobs(count, pipeline, workers, warmup, duration)
+                        for count in connections
+                    ]
+                    for knobs in points:
+                        LOG.info("sweep %s: connections=%d", spec.name, knobs.connections)
+                        result = _run_bench_probe(pool, run.address, knobs)
+                        latency = result["latency_ms"]
+                        rows.append(
+                            [
+                                spec.name,
+                                knobs.connections,
+                                knobs.workers,
+                                knobs.pipeline,
+                                f"{result['validated_per_sec']:.0f}",
+                                f"{latency['p50']:.3f}",
+                                f"{latency['p95']:.3f}",
+                                f"{latency['p99']:.3f}",
+                                f"{result['cpu_pct']:.0f}",
+                                f"{result['rss_mib']:.0f}",
+                            ]
+                        )
+                        records.append(
+                            {
+                                "pool": spec.name,
+                                "connections": knobs.connections,
+                                "workers": knobs.workers,
+                                "pipeline": knobs.pipeline,
+                                **result,
+                            }
+                        )
+            except _POOL_ERRORS as exc:
+                LOG.error("pool %s failed: %s", spec.name, exc)
+                rows.append([spec.name, "FAILED", "-", "-", "-", "-", "-", "-", "-", "-"])
+                failed = True
+    _emit(headers, rows, csv_path)
+    _persist(out, label, "sweep", registry, profile_name, None, headers, rows, records)
+    return 1 if failed else 0
+
+
+def connscale(
+    registry: config.Registry,
+    pool_names: Sequence[str],
+    profile_name: str,
+    connections: Sequence[int],
+    *,
+    hold: float = 14.0,
+    out: str | None = None,
+    label: str | None = None,
+    keep: bool = False,
+) -> int:
+    """Per-connection memory: open N idle Stratum connections and read the pool's peak RSS."""
+    profile = registry.profile(profile_name)
+    headers = ["pool", "conns", "established", "peak_MiB"]
+    rows: list[list[object]] = []
+    with session(registry, keep=keep) as run:
+        for spec in _pool_specs(registry, pool_names):
+            for count in connections:
+                LOG.info("connscale %s: %d connections", spec.name, count)
+                try:
+                    with adapters.PoolUnderTest(run, spec, profile, keep=keep) as pool:
+                        args = _stratum_args(pool, run.address) + [
+                            "--connections",
+                            str(count),
+                            "--hold",
+                            str(hold),
+                        ]
+                        with pool.sampler() as sampler:
+                            output = pool.run_probe(
+                                "connscale.py",
+                                args,
+                                timeout=hold + max(_PROBE_OVERHEAD_SECONDS, count / 50),
+                                extra_run_args=_WIDE_PORT_RANGE,
+                            )
+                        match = _ESTABLISHED_RE.search(output)
+                        established = match.group(0).removeprefix("ESTABLISHED ") if match else "?"
+                        _, peak_rss = report.parse_docker_stats(sampler.lines)
+                        rows.append([spec.name, count, established, f"{peak_rss:.0f}"])
+                except _POOL_ERRORS as exc:
+                    LOG.error("pool %s failed: %s", spec.name, exc)
+                    rows.append([spec.name, count, "FAILED", "-"])
+    _emit(headers, rows, None)
+    _persist(out, label, "connscale", registry, profile_name, None, headers, rows, [])
+    return 0
+
+
+def conn_limit(
+    registry: config.Registry,
+    pool_names: Sequence[str],
+    profile_name: str,
+    *,
+    cap: int = 5000,
+    out: str | None = None,
+    label: str | None = None,
+    keep: bool = False,
+) -> int:
+    """Open connections one at a time until the pool stops accepting; report the ceiling."""
+    profile = registry.profile(profile_name)
+    headers = ["pool", "result"]
+    rows: list[list[object]] = []
+    with session(registry, keep=keep) as run:
+        for spec in _pool_specs(registry, pool_names):
+            LOG.info("conn-limit %s (cap %d)", spec.name, cap)
+            try:
+                with adapters.PoolUnderTest(run, spec, profile, keep=keep) as pool:
+                    args = [pool.stratum_host, str(pool.stratum_port), run.address, str(cap)]
+                    timeout = max(600.0, cap / 50 + 300)
+                    output = pool.run_probe(
+                        "conn_probe.py", args, timeout=timeout, extra_run_args=_WIDE_PORT_RANGE
+                    )
+                    match = _RESULT_LINE_RE.search(output)
+                    rows.append([spec.name, match.group(0) if match else output.strip()[-200:]])
+            except _POOL_ERRORS as exc:
+                LOG.error("pool %s failed: %s", spec.name, exc)
+                rows.append([spec.name, "FAILED"])
+    _emit(headers, rows, None)
+    _persist(out, label, "conn-limit", registry, profile_name, None, headers, rows, [])
+    return 0
+
+
+def latency(
+    registry: config.Registry,
+    pool_names: Sequence[str],
+    profile_name: str,
+    *,
+    rounds: int = 20,
+    out: str | None = None,
+    label: str | None = None,
+    keep: bool = False,
+) -> int:
+    """New-block -> miner-gets-new-work latency, timed from a connected Stratum client's view."""
+    profile = registry.profile(profile_name)
+    headers = ["pool", "new block -> new work"]
+    rows: list[list[object]] = []
+    with session(registry, mine_maturity=True, keep=keep) as run:
+        for spec in _pool_specs(registry, pool_names):
+            LOG.info("latency %s (%d rounds)", spec.name, rounds)
+            try:
+                with adapters.PoolUnderTest(run, spec, profile, keep=keep) as pool:
+                    args = _stratum_args(pool, run.address) + [
+                        "--rpc",
+                        run.backend.rpc_endpoint_in_network(),
+                        "--rpc-user",
+                        run.backend.rpc_user,
+                        "--rpc-pass",
+                        run.backend.rpc_pass,
+                        "--rounds",
+                        str(rounds),
+                    ]
+                    output = pool.run_probe(
+                        "zmqlatency.py", args, timeout=rounds * 15 + _PROBE_OVERHEAD_SECONDS
+                    )
+                    lines = output.strip().splitlines()
+                    rows.append([spec.name, lines[-1] if lines else "no output"])
+            except _POOL_ERRORS as exc:
+                LOG.error("pool %s failed: %s", spec.name, exc)
+                rows.append([spec.name, "FAILED"])
+    _emit(headers, rows, None)
+    _persist(out, label, "latency", registry, profile_name, None, headers, rows, [])
+    return 0
+
+
+def _run_work_audit(
+    pool: adapters.PoolUnderTest, address: str, *, connections: int, duration: float
+) -> tuple[int, str]:
+    """Drive the test miner with --audit-work across N connections; return (exit_code, output).
+
+    The miner fingerprints the (extranonce1, work) each connection is handed and exits 3 if the pool
+    ever re-issues identical work or hands two connections the same search space.
+    """
+    args = [
+        "--url",
+        f"{pool.stratum_host}:{pool.stratum_port}",
+        "--user",
+        address,
+        "--connections",
+        str(connections),
+        "--workers",
+        "1",
+        "--audit-work",
+        "--duration",
+        str(duration),
+    ]
+    return pool.run_miner(args, timeout=duration + _PROBE_OVERHEAD_SECONDS)
+
+
+def validate(
+    registry: config.Registry,
+    pool_names: Sequence[str],
+    profile_name: str,
+    *,
+    connections: int = 4,
+    duration: float = 20.0,
+    out: str | None = None,
+    label: str | None = None,
+    keep: bool = False,
+) -> int:
+    """Validation suite. Today: the cross-connection work audit (no duplicate / overlapping work).
+    Exit 0 iff every pool passes."""
+    profile = registry.profile(profile_name)
+    headers = ["pool", "work-audit"]
+    rows: list[list[object]] = []
+    overall_ok = True
+    with session(registry, keep=keep) as run:
+        for spec in _pool_specs(registry, pool_names):
+            print(f"== validating {spec.name} ==")
+            try:
+                with adapters.PoolUnderTest(run, spec, profile, keep=keep) as pool:
+                    code, output = _run_work_audit(
+                        pool, run.address, connections=connections, duration=duration
+                    )
+                    print(output.rstrip())
+                    passed = code == 0
+                    print(f"  work-audit: {'PASS' if passed else 'FAIL'}\n")
+                    rows.append([spec.name, "PASS" if passed else "FAIL"])
+                    overall_ok = overall_ok and passed
+            except _POOL_ERRORS as exc:
+                LOG.error("pool %s failed: %s", spec.name, exc)
+                print(f"  ERROR: {exc}\n")
+                rows.append([spec.name, "ERROR"])
+                overall_ok = False
+    print("ALL POOLS PASSED" if overall_ok else "VALIDATION FAILURES")
+    _persist(out, label, "validate", registry, profile_name, None, headers, rows, [])
+    return 0 if overall_ok else 1
+
+
+def test(
+    registry: config.Registry,
+    pool_names: Sequence[str],
+    profile_name: str,
+    knobs: BenchKnobs,
+    *,
+    audit_connections: int = 4,
+    audit_duration: float = 20.0,
+    out: str | None = None,
+    label: str | None = None,
+    keep: bool = False,
+) -> int:
+    """Build + exercise each pool end to end: the work audit (correctness) and the throughput bench
+    (performance), in a single regtest session. Exit 0 iff every pool passes its audit."""
+    profile = registry.profile(profile_name)
+    headers = ["pool", "work-audit", "val/s", "p50ms", "cpu%", "rssMiB"]
+    rows: list[list[object]] = []
+    records: list[dict[str, Any]] = []
+    overall_ok = True
+    with session(registry, keep=keep) as run:
+        for spec in _pool_specs(registry, pool_names):
+            LOG.info("testing %s", spec.name)
+            try:
+                with adapters.PoolUnderTest(run, spec, profile, keep=keep) as pool:
+                    code, _ = _run_work_audit(
+                        pool, run.address, connections=audit_connections, duration=audit_duration
+                    )
+                    result = _run_bench_probe(pool, run.address, knobs)
+                audit = "PASS" if code == 0 else "FAIL"
+                overall_ok = overall_ok and code == 0
+                rows.append(
+                    [
+                        spec.name,
+                        audit,
+                        f"{result['validated_per_sec']:.0f}",
+                        f"{result['latency_ms']['p50']:.3f}",
+                        f"{result['cpu_pct']:.0f}",
+                        f"{result['rss_mib']:.0f}",
+                    ]
+                )
+                records.append({"pool": spec.name, "work_audit": audit, **result})
+            except _POOL_ERRORS as exc:
+                LOG.error("pool %s failed: %s", spec.name, exc)
+                rows.append([spec.name, "ERROR", "-", "-", "-", "-"])
+                overall_ok = False
+    _emit(headers, rows, None)
+    _persist(
+        out,
+        label,
+        "test",
+        registry,
+        profile_name,
+        dataclasses.asdict(knobs),
+        headers,
+        rows,
+        records,
+    )
+    return 0 if overall_ok else 1
+
+
+def _format_cpuset(cores: Sequence[int]) -> str:
+    """Render sorted core indices as a docker cpuset, collapsing runs ([5,6,7] -> "5-7")."""
+    parts = []
+    start = prev = cores[0]
+    for core in cores[1:]:
+        if core == prev + 1:
+            prev = core
+        else:
+            parts.append(f"{start}-{prev}" if start != prev else str(start))
+            start = prev = core
+    parts.append(f"{start}-{prev}" if start != prev else str(start))
+    return ",".join(parts)
+
+
+def _registry_for_cores(
+    registry: config.Registry, pool_cpus: str, host_cores: int
+) -> config.Registry:
+    """A copy of registry pinned with the pool on `pool_cpus` and the load generator on the cores
+    left over after bitcoind and the pool (so the two never share a core)."""
+    bitcoind = config.cpuset_members(registry.pinning.bitcoind_cpus)
+    free = sorted(set(range(host_cores)) - bitcoind - config.cpuset_members(pool_cpus))
+    if not free:
+        raise config.ConfigError(
+            f"no cores left for the load generator with pool_cpus={pool_cpus!r} on a "
+            f"{host_cores}-core host (pick a smaller --cores)"
+        )
+    pinning = dataclasses.replace(
+        registry.pinning, enabled=True, pool_cpus=pool_cpus, bench_cpus=_format_cpuset(free)
+    )
+    return dataclasses.replace(registry, pinning=pinning)
+
+
+def suite(
+    registry: config.Registry,
+    pool_names: Sequence[str],
+    profile_name: str,
+    knobs: BenchKnobs,
+    *,
+    cores: Sequence[str],
+    repeat: int = 3,
+    out: str | None = None,
+) -> int:
+    """Run every measurement (each in its own regtest session), all persisted to `out`.
+
+    bench runs at each cpuset in `cores` (labeled by core count, best-of-`repeat` to damp noise);
+    sweep -> connscale -> conn-limit -> latency -> validate run once at the largest config. The load
+    generator gets the cores left over after bitcoind + the pool. Non-zero if any failed.
+    """
+    host_cores = os.cpu_count() or 1
+    overall = 0
+    for pool_cpus in cores:
+        core_label = f"{config.cpuset_count(pool_cpus)}-core"
+        core_registry = _registry_for_cores(registry, pool_cpus, host_cores)
+        LOG.info("=== suite: bench (%s) ===", core_label)
+        overall |= bench(
+            core_registry, pool_names, profile_name, knobs, repeat=repeat, out=out, label=core_label
+        )
+
+    largest = max(cores, key=config.cpuset_count)
+    rest_label = f"{config.cpuset_count(largest)}-core"
+    rest = _registry_for_cores(registry, largest, host_cores)
+    LOG.info("=== suite: sweep ===")
+    overall |= sweep(rest, pool_names, profile_name, _SUITE_SWEEP_CONNS, out=out, label=rest_label)
+    LOG.info("=== suite: connscale ===")
+    overall |= connscale(
+        rest, pool_names, profile_name, _SUITE_CONNSCALE_CONNS, out=out, label=rest_label
+    )
+    LOG.info("=== suite: conn-limit ===")
+    overall |= conn_limit(
+        rest, pool_names, profile_name, cap=_SUITE_CONN_CAP, out=out, label=rest_label
+    )
+    LOG.info("=== suite: latency ===")
+    overall |= latency(
+        rest, pool_names, profile_name, rounds=_SUITE_LATENCY_ROUNDS, out=out, label=rest_label
+    )
+    LOG.info("=== suite: validate ===")
+    overall |= validate(rest, pool_names, profile_name, out=out, label=rest_label)
+    return overall

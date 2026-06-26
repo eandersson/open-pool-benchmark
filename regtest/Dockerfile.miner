@@ -1,0 +1,17 @@
+FROM debian:trixie-slim AS build
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential automake autoconf pkg-config \
+        libcurl4-openssl-dev libjansson-dev libssl-dev \
+        ca-certificates git && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+RUN git clone --depth=1 https://github.com/pooler/cpuminer.git . \
+    && ./autogen.sh \
+    && ./configure CFLAGS="-O2" \
+    && make -j"$(nproc)" \
+    && strip minerd
+
+FROM debian:trixie-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libcurl4 libjansson4 && rm -rf /var/lib/apt/lists/*
+COPY --from=build /src/minerd /usr/local/bin/minerd
+ENTRYPOINT ["minerd"]

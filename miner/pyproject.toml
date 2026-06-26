@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openbench-miner"
+version = "0.1.0"
+description = "Stratum v1 CPU test miner + work-distribution auditor for solo mining pools"
+license = "GPL-3.0-or-later"
+requires-python = ">=3.14
+dependencies = []
+
+[project.scripts]
+openbench-miner = "openbench_miner:main"
+
+[tool.setuptools]
+py-modules = ["openbench_miner"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+
+[tool.ruff.lint]
+extend-select = ["I"]
+
+[tool.ruff.lint.isort]
+force-single-line = true

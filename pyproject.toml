@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "open-pool-benchmark"
+version = "0.1.0"
+description = "Pluggable benchmark + validation harness for Bitcoin solo mining pools"
+license = "GPL-3.0-or-later"
+requires-python = ">=3.14"
+dependencies = [
+    "pyyaml>=6",
+]
+
+[project.optional-dependencies]
+dev = ["coverage>=7", "ruff>=0.6", "mypy>=1.10", "types-pyyaml>=6"]
+
+[project.scripts]
+openbench = "openbench.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["openbench*"]
+exclude = ["openbench.tests*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+extend-exclude = ["openbench/probes"]
+
+[tool.ruff.lint]
+extend-select = ["E", "W", "F", "I", "B", "UP"]
+
+[tool.ruff.lint.per-file-ignores]
+"openbench/results.py" = ["E501"]
+
+[tool.ruff.lint.isort]
+force-single-line = true
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.mypy]
+strict = true
+files = ["openbench"]
+exclude = "(tests/|openbench/probes/)"
+
+[tool.coverage.run]
+source = ["openbench"]
+omit = ["*/tests/*", "*/probes/*"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+]

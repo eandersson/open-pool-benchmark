@@ -1,0 +1,59 @@
+# Shared regtest harness for open-pool-benchmark: a regtest bitcoind plus a CPU stratum miner
+# (pooler/cpuminer). The orchestrator (`openbench`) brings bitcoind up on this compose's network,
+# starts each pool-under-test on the same network, and drives load at it.
+#
+#   docker compose -f regtest/docker-compose.yml -p openbench-regtest up -d bitcoind
+#   docker compose -f regtest/docker-compose.yml -p openbench-regtest build miner
+#   docker compose -f regtest/docker-compose.yml -p openbench-regtest down -v
+#
+# The project name is fixed (openbench-regtest) so the network ("openbench-regtest_default") and the
+# built miner image ("openbench-miner:latest") are predictable; the bitcoind container is named so
+# pools reach it as `bitcoind` on the network and the orchestrator can `docker exec bitcoind`.
+name: openbench-regtest
+
+services:
+  bitcoind:
+    container_name: bitcoind
+    build:
+      context: .
+      dockerfile: Dockerfile.bitcoind
+    image: openbench-bitcoind:regtest
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    read_only: true
+    tmpfs: ["/tmp"]
+    pids_limit: 256
+    mem_limit: 2g
+    volumes:
+      - bitcoin-data:/data
+    ports:
+      - "127.0.0.1::18443"
+    healthcheck:
+      test: ["CMD", "bitcoin-cli", "-regtest", "-rpcuser=openbench",
+             "-rpcpassword=openbenchpass", "-rpcport=18443", "getblockchaininfo"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  miner:
+    build:
+      context: .
+      dockerfile: Dockerfile.miner
+    image: openbench-miner:latest
+    profiles: ["mine"]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    read_only: true
+    tmpfs: ["/tmp"]
+    pids_limit: 256
+    mem_limit: 512m
+    command: >
+      --algo sha256d
+      --url stratum+tcp://openbench-pool:3333
+      --user ${MINER_ADDRESS:-bcrt1qlk935ze2fsu86zjp395uvtegztrkaezawxx0wf}
+      --pass x
+      --threads ${MINER_THREADS:-4}
+      --retry-pause 2
+
+volumes:
+  bitcoin-data:
