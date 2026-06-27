@@ -8,8 +8,8 @@ api_listen:
   - 0.0.0.0:7777
 max_clients: 100000
 initial_difficulty: ${DIFFICULTY}
-minimum_difficulty: ${DIFFICULTY}
-variable_difficulty: false
+minimum_difficulty: ${MIN_DIFFICULTY}
+variable_difficulty: true
 coinbase_signature: ${TAG}
 fast_block_notify: true
 zmq_block_endpoint: tcp://${RPC_HOST}:28332

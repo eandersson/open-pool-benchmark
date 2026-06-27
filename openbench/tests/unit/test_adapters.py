@@ -63,10 +63,20 @@ class BuildSubstitutionsTests(unittest.TestCase):
         self.assertEqual(mapping["RPC_HOST"], "bitcoind")
         self.assertEqual(mapping["RPC_PORT"], "18443")
         self.assertEqual(mapping["DIFFICULTY"], "1000000")
+        self.assertEqual(mapping["MIN_DIFFICULTY"], "1")  # the vardiff floor (default)
         self.assertEqual(mapping["TAG"], "/openbench/")
         self.assertEqual(mapping["API_PORT"], "5662")
         self.assertEqual(mapping["ADDRESS"], "bcrt1qexampleaddress")
         self.assertEqual(mapping["POOL_HOST"], adapters.POOL_CONTAINER)
+
+    def test_min_difficulty_comes_from_the_profile(self) -> None:
+        mapping = adapters.build_substitutions(
+            base.sample_pool(),
+            base.sample_profile(min_difficulty=0.5),
+            base.sample_regtest(),
+            base.sample_pinning(),
+        )
+        self.assertEqual(mapping["MIN_DIFFICULTY"], "0.5")
 
     def test_api_port_blank_when_absent(self) -> None:
         mapping = adapters.build_substitutions(
@@ -189,7 +199,8 @@ class RealTemplateRenderTests(unittest.TestCase):
         parsed = tomllib.loads(self._render("pogolo"))
         self.assertEqual(parsed["backend"]["host"], "bitcoind:18443")
         self.assertEqual(parsed["pogolo"]["default_difficulty"], 1000000)
-        self.assertIs(parsed["pogolo"]["disable_vardiff"], True)
+        self.assertIs(parsed["pogolo"]["disable_vardiff"], False)  # vardiff on by default
+        self.assertIs(parsed["pogolo"]["ignore_suggested_difficulty"], False)
 
     def test_public_pool_real_template_renders_fully(self) -> None:
         rendered = self._render("public-pool")
@@ -201,8 +212,13 @@ class RealTemplateRenderTests(unittest.TestCase):
         parsed = json.loads(self._render("ckpool"))
         self.assertEqual(parsed["btcd"][0]["url"], "bitcoind:18443")
         self.assertEqual(parsed["serverurl"], ["0.0.0.0:3333"])
-        self.assertEqual(parsed["mindiff"], 1000000)
+        self.assertLess(parsed["mindiff"], parsed["maxdiff"])  # vardiff has room to retarget
         self.assertEqual(parsed["maxdiff"], 1000000)
+
+    def test_erikslund_real_template_enables_variable_difficulty(self) -> None:
+        rendered = self._render("erikslund-cpp")
+        self.assertIn("variable_difficulty: true", rendered)
+        self.assertNotIn("${", rendered)
 
     def test_readiness_urls_render(self) -> None:
         for spec in self.registry.pools.values():

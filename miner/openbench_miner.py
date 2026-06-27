@@ -27,7 +27,6 @@ import threading
 import time
 
 type WorkerJob = dict[str, object]
-type FoundShare = tuple[str, str, str, str, bool]
 
 # Stratum pdiff-1 target: hash <= DIFF1_TARGET / D satisfies difficulty D.
 DIFF1_TARGET = 0xFFFF << 208
@@ -164,11 +163,27 @@ def selftest() -> bool:
     repeat = ["4", "pp", "c1", "c2", ["aa"], "20000000", "1d00ffff", "6553f100", False]
     auditor.record_notify(0, "aaaa", repeat)  # counted again; the run does NOT stop
     assert auditor.duplicate_count == 2
+    assert auditor.vardiff_duplicate_events == []  # no set_difficulty -> not a vardiff straddle
 
     collision = WorkAuditor()  # two connections, one extranonce1
     collision.record_subscribe(0, "cccc")
     assert collision.record_subscribe(1, "cccc") is not None
     assert len(collision.extranonce1_collisions) == 1
+
+    vardiff = WorkAuditor()  # identical work re-issued across a difficulty CHANGE is a vardiff dup
+    vardiff.record_subscribe(0, "dddd")
+    vardiff.record_set_difficulty(0, 1.0)  # the pool's initial baseline difficulty, not a retarget
+    first = ["1", "pp", "c1", "c2", ["aa"], "20000000", "1d00ffff", "6553f100", False]
+    vardiff.record_notify(0, "dddd", first)  # work seen before any genuine retarget
+    vardiff.record_set_difficulty(0, 1.0)  # same value again -> still not a retarget
+    vardiff.record_set_difficulty(0, 2.0)  # difficulty actually changes -> a genuine retarget
+    assert vardiff.set_difficulty_count == 1  # only the change counts, not the baseline/no-op
+    reissued = ["7", "pp", "c1", "c2", ["aa"], "20000000", "1d00ffff", "6553f100", False]
+    assert vardiff.record_notify(0, "dddd", reissued) is not None  # same work, new job id
+    assert vardiff.vardiff_duplicate_count == 1  # re-issued across the retarget
+    fresh = ["8", "pp", "c1", "c2", ["aa"], "20000000", "1d00ffff", "6553f101", False]  # ntime++
+    assert vardiff.record_notify(0, "dddd", fresh) is None  # genuinely new work -> not a duplicate
+    assert vardiff.vardiff_duplicate_count == 1  # unchanged: fresh work after a retarget is fine
     return matched
 
 
@@ -230,9 +245,15 @@ class WorkAuditor:
         self._lock = threading.Lock()
         self._extranonce1_owner: dict[str, int] = {}  # extranonce1 -> first connection id
         self._seen: dict[bytes, str] = {}  # (extranonce1, work) digest -> "connN/jobX"
+        self._seen_owner: dict[bytes, tuple[int, int]] = {}  # digest -> (first conn, its epoch then)
+        self._conn_epoch: dict[int, int] = {}  # connection id -> genuine retargets seen so far
+        self._conn_difficulty: dict[int, float] = {}  # connection id -> its current difficulty
         self.notifies_seen = 0
         self.duplicate_events: list[str] = []
         self.extranonce1_collisions: list[str] = []
+        self.set_difficulty_count = 0  # genuine difficulty CHANGES (the initial baseline is not one)
+        self.difficulties_seen: set[float] = set()
+        self.vardiff_duplicate_events: list[str] = []  # duplicates re-issued across a diff change
         self.failure: str | None = None  # first problem seen (kept for logging)
 
     @staticmethod
@@ -270,6 +291,18 @@ class WorkAuditor:
             self._extranonce1_owner.setdefault(extranonce1, conn_id)
             return None
 
+    def record_set_difficulty(self, conn_id: int, difficulty: float) -> None:
+        """Note a mining.set_difficulty for a connection. Only a value that DIFFERS from the
+        connection's current difficulty is a genuine retarget (the first one a pool sends is just its
+        baseline); work re-issued to a connection after its own retarget is the after-vardiff bug."""
+        with self._lock:
+            self.difficulties_seen.add(difficulty)
+            previous = self._conn_difficulty.get(conn_id)
+            self._conn_difficulty[conn_id] = difficulty
+            if previous is not None and previous != difficulty:
+                self.set_difficulty_count += 1
+                self._conn_epoch[conn_id] = self._conn_epoch.get(conn_id, 0) + 1
+
     def record_notify(self, conn_id: int, extranonce1: str, notify_params: list) -> str | None:
         """Record one job; if its effective work repeats, tally it and return the message."""
         job_id = str(notify_params[0])
@@ -286,9 +319,16 @@ class WorkAuditor:
                     f"{prior} -- the identical search space is being mined twice"
                 )
                 self.duplicate_events.append(message)
+                owner_id, owner_epoch = self._seen_owner[digest]
+                if self._conn_epoch.get(owner_id, 0) > owner_epoch:
+                    self.vardiff_duplicate_events.append(
+                        f"VARDIFF DUPLICATE: {label} was re-issued identical work after a "
+                        f"difficulty change (first seen as {prior})"
+                    )
                 self.failure = self.failure or message
                 return message
             self._seen.setdefault(digest, label)
+            self._seen_owner.setdefault(digest, (conn_id, self._conn_epoch.get(conn_id, 0)))
             return None
 
     @property
@@ -298,6 +338,10 @@ class WorkAuditor:
     @property
     def duplicate_count(self) -> int:
         return len(self.duplicate_events)
+
+    @property
+    def vardiff_duplicate_count(self) -> int:
+        return len(self.vardiff_duplicate_events)
 
 
 def _prepare_search(job: WorkerJob, extranonce2: int) -> tuple:
@@ -543,6 +587,8 @@ class StratumClient:
             case "mining.set_difficulty":
                 self.difficulty = float(params[0])
                 LOG.info("difficulty set to %s", self.difficulty)
+                if self.work_auditor is not None:
+                    self.work_auditor.record_set_difficulty(self.conn_id, self.difficulty)
                 self._republish_job()
             case "mining.notify":
                 self._on_notify(params)
@@ -770,6 +816,30 @@ def run_miner(args: argparse.Namespace) -> int:
                     num_connections,
                     auditor.unique_work_units,
                 )
+            if auditor.set_difficulty_count == 0:
+                LOG.warning(
+                    "vardiff: the pool never retargeted in %.0fs -- the re-send-after-vardiff "
+                    "check did not run; lower the pool's start difficulty or raise --duration",
+                    elapsed,
+                )
+            else:
+                LOG.info(
+                    "vardiff: %d retarget(s) over difficulties %s; %d duplicate(s) re-issued "
+                    "across a change",
+                    auditor.set_difficulty_count,
+                    sorted(auditor.difficulties_seen),
+                    auditor.vardiff_duplicate_count,
+                )
+            summary = {
+                "retargets": auditor.set_difficulty_count,
+                "difficulties": sorted(auditor.difficulties_seen),
+                "duplicates": auditor.duplicate_count,
+                "vardiff_duplicates": auditor.vardiff_duplicate_count,
+                "collisions": len(auditor.extranonce1_collisions),
+                "notifies": auditor.notifies_seen,
+                "connections": num_connections,
+            }
+            print(f"AUDIT {json.dumps(summary)}", flush=True)
     return exit_code
 
 
@@ -820,9 +890,10 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="track (extranonce1, work) across all connections and count how often "
         "the pool re-issues identical work (the duplicate-work bug) or hands "
-        "two connections the same search space. With --duration, runs the full "
-        "time and reports the tally; otherwise stops at the first duplicate. "
-        "Exit code 3 if any duplicates/collisions were seen.",
+        "two connections the same search space. Also records every mining.set_difficulty "
+        "and flags work re-issued across a difficulty change (the after-vardiff bug). With "
+        "--duration, runs the full time and reports the tally plus an 'AUDIT {json}' line; "
+        "otherwise stops at the first duplicate. Exit code 3 if any duplicates/collisions.",
     )
     parser.add_argument(
         "--selftest", action="store_true", help="verify hashing against the genesis block and exit"

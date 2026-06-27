@@ -46,6 +46,8 @@ _SUITE_CONNSCALE_CONNS = [1000, 32000]
 _SUITE_CONN_CAP = 32000
 _SUITE_LATENCY_ROUNDS = 20
 _SUITE_MAX_WORKERS = 16
+_VARDIFF_AUDIT_WORKERS = 4
+_VARDIFF_AUDIT_DURATION = 90.0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -466,12 +468,19 @@ def latency(
 
 
 def _run_work_audit(
-    pool: adapters.PoolUnderTest, address: str, *, connections: int, duration: float
+    pool: adapters.PoolUnderTest,
+    address: str,
+    *,
+    connections: int,
+    duration: float,
+    workers: int = 1,
 ) -> tuple[int, str]:
     """Drive the test miner with --audit-work across N connections; return (exit_code, output).
 
     The miner fingerprints the (extranonce1, work) each connection is handed and exits 3 if the pool
-    ever re-issues identical work or hands two connections the same search space.
+    re-issues identical work, hands two connections the same search space, or (since pools run
+    vardiff-on) re-issues already-searched work across a difficulty change. It also prints an
+    `AUDIT {json}` summary line.
     """
     args = [
         "--url",
@@ -481,12 +490,32 @@ def _run_work_audit(
         "--connections",
         str(connections),
         "--workers",
-        "1",
+        str(workers),
         "--audit-work",
         "--duration",
         str(duration),
     ]
     return pool.run_miner(args, timeout=duration + _PROBE_OVERHEAD_SECONDS)
+
+
+def _parse_audit_line(output: str) -> dict[str, Any]:
+    """Pull the miner's `AUDIT {json}` summary line out of its combined output (empty if absent)."""
+    for line in reversed(output.splitlines()):
+        if line.startswith("AUDIT "):
+            try:
+                parsed: dict[str, Any] = json.loads(line[len("AUDIT ") :])
+            except json.JSONDecodeError:
+                return {}
+            return parsed
+    return {}
+
+
+def _as_int(stats: dict[str, Any], key: str) -> int:
+    """Read an integer stat from a parsed AUDIT summary, tolerating a missing or odd value."""
+    try:
+        return int(stats.get(key, 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 def validate(
@@ -495,16 +524,24 @@ def validate(
     profile_name: str,
     *,
     connections: int = 4,
-    duration: float = 20.0,
+    duration: float = _VARDIFF_AUDIT_DURATION,
     out: str | None = None,
     label: str | None = None,
     keep: bool = False,
 ) -> int:
-    """Validation suite. Today: the cross-connection work audit (no duplicate / overlapping work).
-    Exit 0 iff every pool passes."""
+    """Validation suite: the cross-connection work audit. Pools run vardiff-on (their production
+    mode), so besides duplicate / overlapping work across connections, the audit also flags work the
+    pool re-issues across a difficulty change.
+
+    A pool is PASS only if it actually retargeted during the run AND no duplicate/overlap was seen.
+    A run where vardiff never fired is reported INCONCLUSIVE (not a clean pass) -- the
+    re-send-after-vardiff check never ran; lengthen --duration or lower the pool's start difficulty.
+    Exit 0 iff every pool passed.
+    """
     profile = registry.profile(profile_name)
-    headers = ["pool", "work-audit"]
+    headers = ["pool", "audit", "retargets", "dup-work", "vardiff-dups"]
     rows: list[list[object]] = []
+    records: list[dict[str, Any]] = []
     overall_ok = True
     with session(registry, keep=keep) as run:
         for spec in _pool_specs(registry, pool_names):
@@ -512,20 +549,38 @@ def validate(
             try:
                 with adapters.PoolUnderTest(run, spec, profile, keep=keep) as pool:
                     code, output = _run_work_audit(
-                        pool, run.address, connections=connections, duration=duration
+                        pool,
+                        run.address,
+                        connections=connections,
+                        duration=duration,
+                        workers=_VARDIFF_AUDIT_WORKERS,
                     )
-                    print(output.rstrip())
-                    passed = code == 0
-                    print(f"  work-audit: {'PASS' if passed else 'FAIL'}\n")
-                    rows.append([spec.name, "PASS" if passed else "FAIL"])
-                    overall_ok = overall_ok and passed
+                    stats = _parse_audit_line(output)
+                    retargets = _as_int(stats, "retargets")
+                    dups = _as_int(stats, "duplicates")
+                    vdups = _as_int(stats, "vardiff_duplicates")
+                    if code != 0:
+                        verdict = "FAIL"
+                    elif retargets == 0:
+                        verdict = "INCONCLUSIVE"
+                    else:
+                        verdict = "PASS"
+                    print(f"  audit: {verdict} ({retargets} retargets, {vdups} vardiff dups)\n")
+                    rows.append([spec.name, verdict, retargets, dups, vdups])
+                    records.append({"pool": spec.name, "verdict": verdict, **stats})
+                    overall_ok = overall_ok and verdict == "PASS"
             except _POOL_ERRORS as exc:
                 LOG.error("pool %s failed: %s", spec.name, exc)
                 print(f"  ERROR: {exc}\n")
-                rows.append([spec.name, "ERROR"])
+                rows.append([spec.name, "ERROR", 0, 0, 0])
                 overall_ok = False
-    print("ALL POOLS PASSED" if overall_ok else "VALIDATION FAILURES")
-    _persist(out, label, "validate", registry, profile_name, None, headers, rows, [])
+    print("ALL POOLS PASSED" if overall_ok else "VALIDATION INCOMPLETE/FAILED")
+    knobs: dict[str, object] = {
+        "connections": connections,
+        "workers": _VARDIFF_AUDIT_WORKERS,
+        "duration": duration,
+    }
+    _persist(out, label, "validate", registry, profile_name, knobs, headers, rows, records)
     return 0 if overall_ok else 1
 
 

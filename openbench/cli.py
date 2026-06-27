@@ -141,10 +141,17 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_common(latency)
     latency.add_argument("--rounds", type=int, default=20)
 
-    validate = sub.add_parser("validate", help="validation suite (cross-connection work audit)")
+    validate = sub.add_parser(
+        "validate", help="validation suite (vardiff-on work audit: duplicate / overlapping work)"
+    )
     _add_common(validate)
     validate.add_argument("--connections", type=int, default=4)
-    validate.add_argument("--duration", type=float, default=20.0)
+    validate.add_argument(
+        "--duration",
+        type=float,
+        default=runner._VARDIFF_AUDIT_DURATION,
+        help="audit window in seconds; long enough that vardiff retargets at least once",
+    )
 
     test = sub.add_parser(
         "test", help="build + exercise each pool: work audit (validate) + throughput (bench)"

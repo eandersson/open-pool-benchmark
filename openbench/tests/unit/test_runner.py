@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import json
 import pathlib
 import unittest
 from unittest import mock
@@ -9,6 +11,25 @@ from unittest import mock
 from openbench import config
 from openbench import runner
 from openbench.tests import base
+
+
+@contextlib.contextmanager
+def _fake_session(*_args: object, **_kwargs: object):
+    run = mock.Mock()
+    run.address = "addr"
+    yield run
+
+
+class _FakePool:
+    def __enter__(self) -> object:
+        return mock.Mock()
+
+    def __exit__(self, *_args: object) -> bool:
+        return False
+
+
+def _audit_line(**fields: int) -> str:
+    return "AUDIT " + json.dumps(fields)
 
 
 def _registry() -> config.Registry:
@@ -128,4 +149,79 @@ class SuiteTests(unittest.TestCase):
         )
         self.assertEqual([lbl for name, lbl in calls if name == "bench"], ["1-core", "4-core"])
         self.assertEqual([lbl for name, lbl in calls if name == "sweep"], ["4-core"])  # the largest
+        self.assertEqual(code, 1)
+
+
+class ParseAuditLineTests(unittest.TestCase):
+    def test_extracts_the_audit_json_amid_log_lines(self) -> None:
+        output = (
+            "12:00:00 INFO    running 2 connection(s)\n"
+            'AUDIT {"retargets": 3, "duplicates": 1, "vardiff_duplicates": 1}\n'
+            "12:00:30 INFO    stopping\n"
+        )
+        self.assertEqual(
+            runner._parse_audit_line(output),
+            {"retargets": 3, "duplicates": 1, "vardiff_duplicates": 1},
+        )
+
+    def test_takes_the_last_audit_line(self) -> None:
+        output = 'AUDIT {"retargets": 1}\nAUDIT {"retargets": 9}\n'
+        self.assertEqual(runner._parse_audit_line(output), {"retargets": 9})
+
+    def test_missing_or_malformed_yields_empty(self) -> None:
+        self.assertEqual(runner._parse_audit_line("no audit here\n"), {})
+        self.assertEqual(runner._parse_audit_line("AUDIT not-json\n"), {})
+
+
+class ValidateVerdictTests(unittest.TestCase):
+    """validate()'s verdict + row assembly, with the Docker-driven audit stubbed out."""
+
+    def _validate(self, audit_results: list[tuple[int, str]]) -> tuple[int, list]:
+        specs = []
+        for index in range(len(audit_results)):
+            spec = mock.Mock()
+            spec.name = f"pool{index}"
+            specs.append(spec)
+        results = iter(audit_results)
+
+        def fake_audit(*_args: object, **_kwargs: object) -> tuple[int, str]:
+            return next(results)
+
+        with (
+            mock.patch("openbench.runner.session", _fake_session),
+            mock.patch("openbench.runner._pool_specs", return_value=specs),
+            mock.patch("openbench.adapters.PoolUnderTest", lambda *a, **k: _FakePool()),
+            mock.patch("openbench.runner._run_work_audit", side_effect=fake_audit),
+            mock.patch("openbench.runner._persist") as persist,
+        ):
+            code = runner.validate(mock.Mock(), ["pool0"], "validation", out=None)
+        rows = persist.call_args.args[7]
+        return code, rows
+
+    def test_pass_needs_a_retarget_and_no_duplicates(self) -> None:
+        audit = (0, _audit_line(retargets=3, duplicates=0, vardiff_duplicates=0))
+        code, rows = self._validate([audit])
+        self.assertEqual(rows[0], ["pool0", "PASS", 3, 0, 0])
+        self.assertEqual(code, 0)
+
+    def test_zero_retargets_is_inconclusive_not_pass(self) -> None:
+        audit = (0, _audit_line(retargets=0, duplicates=0, vardiff_duplicates=0))
+        code, rows = self._validate([audit])
+        self.assertEqual(rows[0][1], "INCONCLUSIVE")  # vardiff never fired -> not a clean pass
+        self.assertEqual(code, 1)
+
+    def test_duplicate_work_fails(self) -> None:
+        audit = (3, _audit_line(retargets=2, duplicates=1, vardiff_duplicates=1))
+        code, rows = self._validate([audit])
+        self.assertEqual(rows[0], ["pool0", "FAIL", 2, 1, 1])
+        self.assertEqual(code, 1)
+
+    def test_overall_pass_requires_every_pool_to_pass(self) -> None:
+        code, rows = self._validate(
+            [
+                (0, _audit_line(retargets=2, duplicates=0, vardiff_duplicates=0)),
+                (0, _audit_line(retargets=0, duplicates=0, vardiff_duplicates=0)),
+            ]
+        )
+        self.assertEqual([row[1] for row in rows], ["PASS", "INCONCLUSIVE"])
         self.assertEqual(code, 1)

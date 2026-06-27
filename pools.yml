@@ -33,7 +33,8 @@ pinning:
 
 profiles:
   validation:
-    difficulty: 1000000
+    difficulty: 1000000          # vardiff start difficulty
+    min_difficulty: 1            # vardiff floor; below the start so the pool can actually retarget
     coinbase_tag: /openbench/
   mine:
     difficulty: 1
