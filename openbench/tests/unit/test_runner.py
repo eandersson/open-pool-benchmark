@@ -83,6 +83,15 @@ class CoreAllocationTests(unittest.TestCase):
         with self.assertRaises(config.ConfigError):
             runner._registry_for_cores(_registry(), "1-3", host_cores=4)  # 0 + 1,2,3 = all 4
 
+    def test_auto_workers_is_one_per_spare_core_capped(self) -> None:
+        auto = runner.BenchKnobs(workers=0)
+        self.assertEqual(runner._suite_bench_knobs(auto, "2-15").workers, 14)  # 14 spare cores
+        self.assertEqual(runner._suite_bench_knobs(auto, "2-31").workers, 16)  # capped at the max
+        self.assertEqual(runner._suite_bench_knobs(auto, "2").workers, 1)  # single spare core
+
+    def test_explicit_workers_left_alone(self) -> None:
+        self.assertEqual(runner._suite_bench_knobs(runner.BenchKnobs(workers=8), "2-15").workers, 8)
+
 
 class SuiteTests(unittest.TestCase):
     def test_benches_each_core_config_then_rest_once_at_largest(self) -> None:

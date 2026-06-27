@@ -45,6 +45,7 @@ _SUITE_SWEEP_CONNS = [1, 16, 64, 128]
 _SUITE_CONNSCALE_CONNS = [1000, 32000]
 _SUITE_CONN_CAP = 32000
 _SUITE_LATENCY_ROUNDS = 20
+_SUITE_MAX_WORKERS = 16
 
 
 @dataclasses.dataclass(frozen=True)
@@ -620,6 +621,15 @@ def _registry_for_cores(
     return dataclasses.replace(registry, pinning=pinning)
 
 
+def _suite_bench_knobs(knobs: BenchKnobs, bench_cpus: str) -> BenchKnobs:
+    """Default the load generator to one worker per spare core (capped) so it can saturate a fast
+    pool instead of being the bottleneck; an explicit `--workers` (> 0) is left untouched."""
+    if knobs.workers > 0:
+        return knobs
+    workers = min(config.cpuset_count(bench_cpus), _SUITE_MAX_WORKERS)
+    return dataclasses.replace(knobs, workers=max(1, workers))
+
+
 def suite(
     registry: config.Registry,
     pool_names: Sequence[str],
@@ -634,16 +644,19 @@ def suite(
 
     bench runs at each cpuset in `cores` (labeled by core count, best-of-`repeat` to damp noise);
     sweep -> connscale -> conn-limit -> latency -> validate run once at the largest config. The load
-    generator gets the cores left over after bitcoind + the pool. Non-zero if any failed.
+    generator gets the cores left over after bitcoind + the pool, and (unless --workers is given)
+    one worker per spare core so it never bottlenecks the pool. Non-zero if any failed.
     """
     host_cores = os.cpu_count() or 1
     overall = 0
     for pool_cpus in cores:
         core_label = f"{config.cpuset_count(pool_cpus)}-core"
         core_registry = _registry_for_cores(registry, pool_cpus, host_cores)
-        LOG.info("=== suite: bench (%s) ===", core_label)
+        run_knobs = _suite_bench_knobs(knobs, core_registry.pinning.bench_cpus)
+        LOG.info("=== suite: bench (%s, %d workers) ===", core_label, run_knobs.workers)
         overall |= bench(
-            core_registry, pool_names, profile_name, knobs, repeat=repeat, out=out, label=core_label
+            core_registry, pool_names, profile_name, run_knobs, repeat=repeat, out=out,
+            label=core_label,
         )
 
     largest = max(cores, key=config.cpuset_count)

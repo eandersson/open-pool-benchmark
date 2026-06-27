@@ -176,10 +176,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help="pool cpusets to bench at, space-separated (default '1 1-4'); the load generator "
         "takes whatever cores are left",
     )
-    suite.add_argument("--connections", type=int, default=50)
-    suite.add_argument("--pipeline", type=int, default=16)
-    suite.add_argument("--workers", type=int, default=1)
-    suite.add_argument("--warmup", type=float, default=3.0)
+    suite.add_argument("--connections", type=int, default=128)
+    suite.add_argument("--pipeline", type=int, default=32)
+    suite.add_argument(
+        "--workers",
+        type=int,
+        default=0,
+        help="load-generator processes (0 = auto: one per spare core, capped)",
+    )
+    suite.add_argument("--warmup", type=float, default=5.0)
     suite.add_argument("--duration", type=float, default=20.0)
     suite.add_argument(
         "--repeat",
