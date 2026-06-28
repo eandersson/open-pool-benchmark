@@ -514,7 +514,7 @@ def _as_int(stats: dict[str, Any], key: str) -> int:
     """Read an integer stat from a parsed AUDIT summary, tolerating a missing or odd value."""
     try:
         return int(stats.get(key, 0))
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return 0
 
 
@@ -759,7 +759,12 @@ def suite(
         run_knobs = _suite_bench_knobs(knobs, core_registry.pinning.bench_cpus)
         LOG.info("=== suite: bench (%s, %d workers) ===", core_label, run_knobs.workers)
         overall |= bench(
-            core_registry, pool_names, profile_name, run_knobs, repeat=repeat, out=out,
+            core_registry,
+            pool_names,
+            profile_name,
+            run_knobs,
+            repeat=repeat,
+            out=out,
             label=core_label,
         )
 
