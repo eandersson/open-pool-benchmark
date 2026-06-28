@@ -64,6 +64,7 @@ class BuildSubstitutionsTests(unittest.TestCase):
         self.assertEqual(mapping["RPC_PORT"], "18443")
         self.assertEqual(mapping["DIFFICULTY"], "1000000")
         self.assertEqual(mapping["MIN_DIFFICULTY"], "1")  # the vardiff floor (default)
+        self.assertEqual(mapping["MAX_DIFFICULTY"], "1000000")  # the vardiff ceiling (default)
         self.assertEqual(mapping["TAG"], "/openbench/")
         self.assertEqual(mapping["API_PORT"], "5662")
         self.assertEqual(mapping["ADDRESS"], "bcrt1qexampleaddress")
@@ -198,7 +199,7 @@ class RealTemplateRenderTests(unittest.TestCase):
     def test_pogolo_real_template_renders_to_valid_toml(self) -> None:
         parsed = tomllib.loads(self._render("pogolo"))
         self.assertEqual(parsed["backend"]["host"], "bitcoind:18443")
-        self.assertEqual(parsed["pogolo"]["default_difficulty"], 1000000)
+        self.assertEqual(parsed["pogolo"]["default_difficulty"], 0.001)  # low start
         self.assertIs(parsed["pogolo"]["disable_vardiff"], False)  # vardiff on by default
         self.assertIs(parsed["pogolo"]["ignore_suggested_difficulty"], False)
 

@@ -26,6 +26,7 @@ TEMPLATE_VARIABLES = frozenset(
         "RPC_PASS",
         "DIFFICULTY",
         "MIN_DIFFICULTY",
+        "MAX_DIFFICULTY",
         "TAG",
         "ADDRESS",
         "API_PORT",
@@ -71,9 +72,11 @@ class Profile:
     name: str
     difficulty: float
     coinbase_tag: str
-    # The vardiff floor: the lowest difficulty the pool may retarget down to. Kept below the start
-    # (`difficulty`) so variable-difficulty pools have room to actually retarget during a run.
+    # The vardiff floor and ceiling: the difficulty range the pool may retarget within. `difficulty`
+    # is the (low) start so the test miner can submit shares immediately; vardiff then moves up
+    # toward max or down toward min, so both are kept distinct from the start.
     min_difficulty: float = 1.0
+    max_difficulty: float = 1_000_000.0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -299,6 +302,7 @@ def load_registry(path: str | pathlib.Path) -> Registry:
             ),
             coinbase_tag=str(body.get("coinbase_tag", "/openbench/")),
             min_difficulty=float(body.get("min_difficulty", 1.0)),
+            max_difficulty=float(body.get("max_difficulty", 1_000_000.0)),
         )
         for name, body in profiles_raw.items()
     }

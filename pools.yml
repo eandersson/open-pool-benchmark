@@ -33,8 +33,11 @@ pinning:
 
 profiles:
   validation:
-    difficulty: 1000000          # vardiff start difficulty
-    min_difficulty: 1            # vardiff floor; below the start so the pool can actually retarget
+    difficulty: 0.001            # low start: the test miner submits shares (and block-valid ones on
+                                 # regtest) immediately, so block production fires and the flood
+                                 # drives vardiff to retarget
+    min_difficulty: 0.0001       # vardiff floor
+    max_difficulty: 1000000      # vardiff ceiling: room to retarget up from the low start
     coinbase_tag: /openbench/
   mine:
     difficulty: 1
@@ -62,6 +65,7 @@ pools:
     source: build
     build_context: ../public-pool
     repo: https://github.com/benjamin-wilson/public-pool
+    repo_ref: postgresql
     dockerfile: pools/public-pool/Dockerfile
     stratum_port: 3333
     api_port: 3334

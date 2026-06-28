@@ -7,9 +7,11 @@ the container.
 
 from __future__ import annotations
 
+import json
 import logging
 import pathlib
 import time
+from typing import Any
 
 from openbench import config
 from openbench import docker
@@ -79,7 +81,7 @@ class Backend:
         layer caching makes it a no-op once built.
         """
         LOG.info("starting regtest bitcoind (%s)", self.container)
-        docker.compose(self._files, self._project, ["up", "-d", "--build", "bitcoind"])
+        docker.compose(self._files, self._project, ["up", "-d", "--build", "bitcoind", "postgres"])
         deadline = time.monotonic() + _READY_TIMEOUT_SECONDS
         while time.monotonic() < deadline:
             if self._try("getblockchaininfo"):
@@ -107,6 +109,38 @@ class Backend:
 
     def generate(self, blocks: int, address: str) -> None:
         self._cli("generatetoaddress", blocks, address)
+
+    def block_count(self) -> int:
+        """Current best-block height -- how we confirm a pool actually produced a block on-chain."""
+        return int(self._cli("getblockcount").strip())
+
+    @staticmethod
+    def _coinbase_info(block: dict[str, Any]) -> tuple[list[str], str]:
+        """From a getblock(verbosity=2) result: the coinbase output addresses and its scriptSig hex.
+
+        A solo pool's coinbase pays the miner's address and carries its tag in the input script; the
+        witness-commitment output has no address and is skipped.
+        """
+        coinbase = block["tx"][0]
+        addresses: list[str] = []
+        for vout in coinbase.get("vout", []):
+            script = vout.get("scriptPubKey", {})
+            if script.get("address"):
+                addresses.append(script["address"])
+            addresses.extend(script.get("addresses", []))  # pre-22.0 Core used a list
+        sig = coinbase.get("vin", [{}])[0].get("coinbase", "")
+        return addresses, sig
+
+    def coinbase_pays(self, height: int, address: str, tag: str) -> tuple[bool, bool]:
+        """Whether the block at `height` pays `address` and embeds `tag` in its coinbase scriptSig.
+
+        This is the core solo-pool correctness check: a pool can produce a block bitcoind accepts
+        while paying the wrong address, which only inspecting the coinbase catches.
+        """
+        block_hash = self._cli("getblockhash", height).strip()
+        block = json.loads(self._cli("getblock", block_hash, 2))
+        addresses, sig = self._coinbase_info(block)
+        return address in addresses, tag.encode().hex() in sig.lower()
 
     def mine_to_maturity(self) -> str:
         """Mine past coinbase maturity for spendable coins; return the address mined to."""

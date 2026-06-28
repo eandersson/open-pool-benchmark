@@ -9,6 +9,7 @@ api_listen:
 max_clients: 100000
 initial_difficulty: ${DIFFICULTY}
 minimum_difficulty: ${MIN_DIFFICULTY}
+maximum_difficulty: ${MAX_DIFFICULTY}
 variable_difficulty: true
 coinbase_signature: ${TAG}
 fast_block_notify: true

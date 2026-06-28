@@ -13,13 +13,6 @@ from openbench import runner
 from openbench.tests import base
 
 
-@contextlib.contextmanager
-def _fake_session(*_args: object, **_kwargs: object):
-    run = mock.Mock()
-    run.address = "addr"
-    yield run
-
-
 class _FakePool:
     def __enter__(self) -> object:
         return mock.Mock()
@@ -174,21 +167,36 @@ class ParseAuditLineTests(unittest.TestCase):
 
 
 class ValidateVerdictTests(unittest.TestCase):
-    """validate()'s verdict + row assembly, with the Docker-driven audit stubbed out."""
+    """validate()'s verdict + row assembly, with the Docker-driven audit and chain stubbed out."""
 
-    def _validate(self, audit_results: list[tuple[int, str]]) -> tuple[int, list]:
+    def _validate(
+        self,
+        audit_results: list[tuple[int, str]],
+        heights: list[int],
+        payout: tuple[bool, bool] = (True, True),
+    ) -> tuple[int, list]:
         specs = []
         for index in range(len(audit_results)):
             spec = mock.Mock()
             spec.name = f"pool{index}"
             specs.append(spec)
         results = iter(audit_results)
+        block_heights = iter(heights)
+        self.coinbase = mock.Mock(return_value=payout)
 
         def fake_audit(*_args: object, **_kwargs: object) -> tuple[int, str]:
             return next(results)
 
+        @contextlib.contextmanager
+        def fake_session(*_args: object, **_kwargs: object):
+            run = mock.Mock()
+            run.address = "addr"
+            run.backend.block_count.side_effect = lambda: next(block_heights)
+            run.backend.coinbase_pays = self.coinbase
+            yield run
+
         with (
-            mock.patch("openbench.runner.session", _fake_session),
+            mock.patch("openbench.runner.session", fake_session),
             mock.patch("openbench.runner._pool_specs", return_value=specs),
             mock.patch("openbench.adapters.PoolUnderTest", lambda *a, **k: _FakePool()),
             mock.patch("openbench.runner._run_work_audit", side_effect=fake_audit),
@@ -198,30 +206,68 @@ class ValidateVerdictTests(unittest.TestCase):
         rows = persist.call_args.args[7]
         return code, rows
 
-    def test_pass_needs_a_retarget_and_no_duplicates(self) -> None:
-        audit = (0, _audit_line(retargets=3, duplicates=0, vardiff_duplicates=0))
-        code, rows = self._validate([audit])
-        self.assertEqual(rows[0], ["pool0", "PASS", 3, 0, 0])
+    def test_pass_needs_retarget_clean_work_and_a_mined_block(self) -> None:
+        code, rows = self._validate([(0, _audit_line(retargets=3))], heights=[100, 103])
+        self.assertEqual(rows[0], ["pool0", "PASS", 3, "yes", 0, 0])
         self.assertEqual(code, 0)
 
+    def test_block_found_but_chain_did_not_advance_fails(self) -> None:
+        audit = (0, _audit_line(retargets=3, blocks_submitted=5))
+        code, rows = self._validate([audit], heights=[100, 100])  # block submitted, no new block
+        self.assertEqual(rows[0], ["pool0", "FAIL", 3, "no-relay", 0, 0])
+        self.assertEqual(code, 1)
+
+    def test_no_block_mined_is_skipped_not_failed(self) -> None:
+        code, rows = self._validate([(0, _audit_line(retargets=3))], heights=[100, 100])
+        self.assertEqual(rows[0][3], "none")  # miner couldn't reach a mineable difficulty
+        self.assertEqual(rows[0][1], "PASS")  # block is best-effort; not held against the pool
+        self.assertEqual(code, 0)
+
+    def test_block_paid_to_wrong_address_fails(self) -> None:
+        audit = (0, _audit_line(retargets=3))
+        code, rows = self._validate([audit], heights=[100, 103], payout=(False, True))
+        self.assertEqual(rows[0], ["pool0", "FAIL", 3, "wrong-payout", 0, 0])
+        self.assertEqual(code, 1)
+
     def test_zero_retargets_is_inconclusive_not_pass(self) -> None:
-        audit = (0, _audit_line(retargets=0, duplicates=0, vardiff_duplicates=0))
-        code, rows = self._validate([audit])
-        self.assertEqual(rows[0][1], "INCONCLUSIVE")  # vardiff never fired -> not a clean pass
+        code, rows = self._validate([(0, _audit_line(retargets=0))], heights=[100, 103])
+        self.assertEqual(rows[0][1], "INCONCLUSIVE")  # vardiff never fired
         self.assertEqual(code, 1)
 
     def test_duplicate_work_fails(self) -> None:
         audit = (3, _audit_line(retargets=2, duplicates=1, vardiff_duplicates=1))
-        code, rows = self._validate([audit])
-        self.assertEqual(rows[0], ["pool0", "FAIL", 2, 1, 1])
+        code, rows = self._validate([audit], heights=[100, 103])
+        self.assertEqual(rows[0], ["pool0", "FAIL", 2, "yes", 1, 1])
         self.assertEqual(code, 1)
 
-    def test_overall_pass_requires_every_pool_to_pass(self) -> None:
-        code, rows = self._validate(
-            [
-                (0, _audit_line(retargets=2, duplicates=0, vardiff_duplicates=0)),
-                (0, _audit_line(retargets=0, duplicates=0, vardiff_duplicates=0)),
-            ]
-        )
+    def test_overall_fails_if_any_pool_is_not_pass(self) -> None:
+        audits = [(0, _audit_line(retargets=2)), (0, _audit_line(retargets=0))]
+        code, rows = self._validate(audits, heights=[10, 12, 10, 12])
         self.assertEqual([row[1] for row in rows], ["PASS", "INCONCLUSIVE"])
+        self.assertEqual(code, 1)
+
+    def test_checks_every_mined_block_not_just_the_tip(self) -> None:
+        self._validate([(0, _audit_line(retargets=3))], heights=[100, 103])  # mined 3 blocks
+        checked = [call.args[0] for call in self.coinbase.call_args_list]
+        self.assertEqual(checked, [101, 102, 103])  # all three, not just the tip
+
+    def test_rpc_value_error_marks_one_pool_error_not_a_crash(self) -> None:
+        spec = mock.Mock()
+        spec.name = "pool0"
+
+        @contextlib.contextmanager
+        def fake_session(*_args: object, **_kwargs: object):
+            run = mock.Mock()
+            run.address = "addr"
+            run.backend.block_count.side_effect = ValueError("garbage from bitcoin-cli")
+            yield run
+
+        with (
+            mock.patch("openbench.runner.session", fake_session),
+            mock.patch("openbench.runner._pool_specs", return_value=[spec]),
+            mock.patch("openbench.adapters.PoolUnderTest", lambda *a, **k: _FakePool()),
+            mock.patch("openbench.runner._persist") as persist,
+        ):
+            code = runner.validate(mock.Mock(), ["pool0"], "validation", out=None)
+        self.assertEqual(persist.call_args.args[7][0][1], "ERROR")  # not a whole-run crash
         self.assertEqual(code, 1)

@@ -58,6 +58,7 @@ def build_substitutions(
         "RPC_PASS": regtest.rpc_pass,
         "DIFFICULTY": format_difficulty(profile.difficulty),
         "MIN_DIFFICULTY": format_difficulty(profile.min_difficulty),
+        "MAX_DIFFICULTY": format_difficulty(profile.max_difficulty),
         "TAG": profile.coinbase_tag,
         "ADDRESS": regtest.address,
         "API_PORT": str(spec.api_port) if spec.api_port is not None else "",

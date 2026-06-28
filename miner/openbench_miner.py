@@ -655,6 +655,7 @@ class _Connection:
         self.hash_counter = mp.Value("Q", 0)
         self.stop_event = mp.Event()
         self.workers: list[mp.Process] = []
+        self.blocks_submitted = 0
         self.client = StratumClient(
             host,
             port,
@@ -704,6 +705,7 @@ class _Connection:
             while True:
                 job_id, extranonce2, ntime, nonce, is_block = self.found_queue.get_nowait()
                 if is_block:
+                    self.blocks_submitted += 1
                     LOG.warning(
                         "*** BLOCK FOUND *** conn=%d job=%s nonce=%s -- submitting",
                         self.conn_id,
@@ -838,6 +840,7 @@ def run_miner(args: argparse.Namespace) -> int:
                 "collisions": len(auditor.extranonce1_collisions),
                 "notifies": auditor.notifies_seen,
                 "connections": num_connections,
+                "blocks_submitted": sum(c.blocks_submitted for c in connections),
             }
             print(f"AUDIT {json.dumps(summary)}", flush=True)
     return exit_code

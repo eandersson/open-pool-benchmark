@@ -40,7 +40,7 @@ _PROBE_OVERHEAD_SECONDS = 180
 _ESTABLISHED_RE = re.compile(r"ESTABLISHED \d+/\d+")
 _RESULT_LINE_RE = re.compile(r"^RESULT .*", re.MULTILINE)
 _WIDE_PORT_RANGE = ["--sysctl", "net.ipv4.ip_local_port_range=1024 65535"]
-_POOL_ERRORS = (adapters.AdapterError, docker.DockerError, KeyError, IndexError)
+_POOL_ERRORS = (adapters.AdapterError, docker.DockerError, KeyError, IndexError, ValueError)
 _SUITE_SWEEP_CONNS = [1, 16, 64, 128]
 _SUITE_CONNSCALE_CONNS = [1000, 32000]
 _SUITE_CONN_CAP = 32000
@@ -518,6 +518,27 @@ def _as_int(stats: dict[str, Any], key: str) -> int:
         return 0
 
 
+def _block_outcome(blocks_submitted: int, height_delta: int, payout_ok: bool) -> str:
+    """Whether the pool turned a block-valid share into an actual, correctly-paid on-chain block."""
+    if height_delta > 0:
+        return "yes" if payout_ok else "wrong-payout"  # block landed but paid the wrong address
+    if blocks_submitted > 0:
+        return "no-relay"  # the miner found a block but the chain never advanced -- pool bug
+    return "none"  # the miner never found a block-valid share (start difficulty too high?)
+
+
+def _validate_verdict(audit_code: int, retargets: int, block: str) -> str:
+    """Combine the checks into one verdict. A real block defect -- found but never relayed, or paid
+    to the wrong address -- FAILs. But block production is best-effort: the CPU test miner can't
+    always reach a pool's difficulty to mine one, so not mining a block ("none") is skipped, not
+    held against the pool. Vardiff never firing is still INCONCLUSIVE (the run didn't test it)."""
+    if audit_code != 0 or block in ("no-relay", "wrong-payout"):
+        return "FAIL"
+    if retargets == 0:
+        return "INCONCLUSIVE"
+    return "PASS"
+
+
 def validate(
     registry: config.Registry,
     pool_names: Sequence[str],
@@ -529,17 +550,21 @@ def validate(
     label: str | None = None,
     keep: bool = False,
 ) -> int:
-    """Validation suite: the cross-connection work audit. Pools run vardiff-on (their production
-    mode), so besides duplicate / overlapping work across connections, the audit also flags work the
-    pool re-issues across a difficulty change.
+    """Validation suite. One run per pool measures three things at once, with pools in their
+    vardiff-on production config:
 
-    A pool is PASS only if it actually retargeted during the run AND no duplicate/overlap was seen.
-    A run where vardiff never fired is reported INCONCLUSIVE (not a clean pass) -- the
-    re-send-after-vardiff check never ran; lengthen --duration or lower the pool's start difficulty.
+    - work distribution: no duplicate / overlapping work across connections;
+    - vardiff: difficulty actually retargets, and no work is re-issued across a change;
+    - block production (best-effort): if the test miner can mine one, the pool must turn it into a
+      real block bitcoind accepts whose coinbase pays the configured address.
+
+    A real defect -- duplicate work, a block the pool never relayed, or one that paid the wrong
+    address -- is FAIL. Vardiff never firing is INCONCLUSIVE (the run didn't exercise it). Not
+    mining a block (the miner can't always reach a pool's difficulty) is skipped, not a failure.
     Exit 0 iff every pool passed.
     """
     profile = registry.profile(profile_name)
-    headers = ["pool", "audit", "retargets", "dup-work", "vardiff-dups"]
+    headers = ["pool", "audit", "retargets", "block", "dup-work", "vardiff-dups"]
     rows: list[list[object]] = []
     records: list[dict[str, Any]] = []
     overall_ok = True
@@ -548,6 +573,7 @@ def validate(
             print(f"== validating {spec.name} ==")
             try:
                 with adapters.PoolUnderTest(run, spec, profile, keep=keep) as pool:
+                    height_before = run.backend.block_count()
                     code, output = _run_work_audit(
                         pool,
                         run.address,
@@ -555,24 +581,47 @@ def validate(
                         duration=duration,
                         workers=_VARDIFF_AUDIT_WORKERS,
                     )
+                    mined = run.backend.block_count() - height_before
+                    payout_ok, tag_ok = True, True
+                    for height in range(height_before + 1, height_before + mined + 1):
+                        paid, tagged = run.backend.coinbase_pays(
+                            height, run.address, profile.coinbase_tag
+                        )
+                        payout_ok = payout_ok and paid
+                        tag_ok = tag_ok and tagged
+                        if not tagged:
+                            LOG.warning(
+                                "pool %s: block at height %d lacks the coinbase tag %r",
+                                spec.name,
+                                height,
+                                profile.coinbase_tag,
+                            )
                     stats = _parse_audit_line(output)
                     retargets = _as_int(stats, "retargets")
                     dups = _as_int(stats, "duplicates")
                     vdups = _as_int(stats, "vardiff_duplicates")
-                    if code != 0:
-                        verdict = "FAIL"
-                    elif retargets == 0:
-                        verdict = "INCONCLUSIVE"
-                    else:
-                        verdict = "PASS"
-                    print(f"  audit: {verdict} ({retargets} retargets, {vdups} vardiff dups)\n")
-                    rows.append([spec.name, verdict, retargets, dups, vdups])
-                    records.append({"pool": spec.name, "verdict": verdict, **stats})
+                    block = _block_outcome(_as_int(stats, "blocks_submitted"), mined, payout_ok)
+                    verdict = _validate_verdict(code, retargets, block)
+                    print(
+                        f"  audit: {verdict} ({retargets} retargets, block {block}, "
+                        f"{vdups} vardiff dups)\n"
+                    )
+                    rows.append([spec.name, verdict, retargets, block, dups, vdups])
+                    records.append(
+                        {
+                            "pool": spec.name,
+                            "verdict": verdict,
+                            "block": block,
+                            "mined": mined,
+                            "coinbase_tag_ok": tag_ok if mined > 0 else None,
+                            **stats,
+                        }
+                    )
                     overall_ok = overall_ok and verdict == "PASS"
             except _POOL_ERRORS as exc:
                 LOG.error("pool %s failed: %s", spec.name, exc)
                 print(f"  ERROR: {exc}\n")
-                rows.append([spec.name, "ERROR", 0, 0, 0])
+                rows.append([spec.name, "ERROR", 0, "none", 0, 0])
                 overall_ok = False
     print("ALL POOLS PASSED" if overall_ok else "VALIDATION INCOMPLETE/FAILED")
     knobs: dict[str, object] = {

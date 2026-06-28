@@ -35,6 +35,25 @@ services:
       timeout: 5s
       retries: 20
 
+  # Postgres for pools that need a database -- currently public-pool's postgresql branch. The
+  # database, user, and password are prefixed `publicpool_` so it's obvious which pool they're for.
+  # Ephemeral (tmpfs, thrown away with the run); reachable on the network as `openbench-postgres`.
+  postgres:
+    container_name: openbench-postgres
+    image: postgres:16-alpine
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 512m
+    tmpfs: ["/var/lib/postgresql/data"]
+    environment:
+      POSTGRES_USER: publicpool_db_user
+      POSTGRES_PASSWORD: publicpool_db_pass
+      POSTGRES_DB: publicpool_db
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U publicpool_db_user -d publicpool_db"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
   miner:
     build:
       context: .
