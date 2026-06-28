@@ -61,6 +61,7 @@ pools:
       timeout_seconds: 40
 
   public-pool:
+    enabled: false
     description: benjamin-wilson/public-pool (TypeScript/Node solo pool, PM2 cluster)
     source: build
     build_context: ../public-pool
