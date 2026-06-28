@@ -1,7 +1,8 @@
 [backend]
 host = '${RPC_HOST}:${RPC_PORT}'
 rpcauth = '${RPC_USER}:${RPC_PASS}'
-poll_interval = 500
+zmq_host = 'tcp://${RPC_HOST}:28332'   # bitcoind zmqpubhashblock topic; instant new-block notify
+poll_interval = 600000
 
 [pogolo]
 host = '0.0.0.0'
