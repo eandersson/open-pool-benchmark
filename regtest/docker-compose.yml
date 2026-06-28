@@ -40,10 +40,10 @@ services:
   # Ephemeral (tmpfs, thrown away with the run); reachable on the network as `openbench-postgres`.
   postgres:
     container_name: openbench-postgres
-    image: postgres:16-alpine
+    image: postgres:18-alpine
     security_opt: ["no-new-privileges:true"]
     mem_limit: 512m
-    tmpfs: ["/var/lib/postgresql/data"]
+    tmpfs: ["/var/lib/postgresql"]
     environment:
       POSTGRES_USER: publicpool_db_user
       POSTGRES_PASSWORD: publicpool_db_pass
