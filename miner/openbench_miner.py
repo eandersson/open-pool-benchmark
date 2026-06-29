@@ -379,13 +379,18 @@ def _search_worker(worker_id: int, num_workers: int, shared, found_queue, hash_c
     Each worker owns a disjoint slice of the extranonce2 space (starts at its
     worker_id, steps by num_workers), so no two ever grind the same header.
     """
-    NONCE_BATCH = 2_000_000
+    FLUSH_BATCH = 2_000_000
+    CHECK_CHUNK = 100_000
+    NONCE_MAX = 0x1_0000_0000
     pack_nonce = _PACK_LE_UINT32
     sha256 = hashlib.sha256
+    get_lock = hash_counter.get_lock
     local_generation = -1
     prepared = None
+    job = None
     extranonce2 = worker_id
     nonce = 0
+    local_hashes = 0
 
     while not stop_event.is_set():
         generation = shared["gen"]
@@ -405,8 +410,9 @@ def _search_worker(worker_id: int, num_workers: int, shared, found_queue, hash_c
         first_block, tail, target, block_target, job_id, ntime_hex, extranonce2_hex = prepared
         copy_ctx = first_block.copy
         target_high16 = target >> 240
-        batch_end = nonce + NONCE_BATCH
-        while nonce < batch_end:
+        chunk_start = nonce
+        chunk_end = min(nonce + CHECK_CHUNK, NONCE_MAX)
+        while nonce < chunk_end:
             block_ctx = copy_ctx()
             block_ctx.update(tail + pack_nonce(nonce))
             digest = sha256(block_ctx.digest()).digest()
@@ -416,14 +422,20 @@ def _search_worker(worker_id: int, num_workers: int, shared, found_queue, hash_c
                     is_block = hash_int <= block_target
                     found_queue.put((job_id, extranonce2_hex, ntime_hex, "%08x" % nonce, is_block))
             nonce += 1
-        with hash_counter.get_lock():
-            hash_counter.value += NONCE_BATCH
+        local_hashes += nonce - chunk_start
+        if local_hashes >= FLUSH_BATCH:
+            with get_lock():
+                hash_counter.value += local_hashes
+            local_hashes = 0
 
-        if nonce > 0xFFFFFFFF:
-            # nonce space exhausted; advance to this worker's next slice
+        if nonce >= NONCE_MAX:
             extranonce2 += num_workers
             nonce = 0
-            prepared = _prepare_search(shared["job"], extranonce2)
+            prepared = _prepare_search(job, extranonce2)
+
+    if local_hashes:
+        with get_lock():
+            hash_counter.value += local_hashes
 
 
 class StratumClient:
@@ -457,7 +469,7 @@ class StratumClient:
 
         self.sock: socket.socket | None = None
         self._send_lock = threading.Lock()
-        self._recv_buf = b""
+        self._recv_buf = bytearray()
         self._next_id = 1
         self._generation = 0
 
@@ -480,9 +492,11 @@ class StratumClient:
     def _send(self, method: str, params: list) -> int:
         message_id = self._next_id
         self._next_id += 1
-        line = json.dumps({"id": message_id, "method": method, "params": params}) + "\n"
+        line = json.dumps(
+            {"id": message_id, "method": method, "params": params}, separators=(",", ":")
+        ).encode() + b"\n"
         with self._send_lock:
-            self.sock.sendall(line.encode())
+            self.sock.sendall(line)
         return message_id
 
     def subscribe(self) -> None:
@@ -509,17 +523,22 @@ class StratumClient:
 
     def read_forever(self) -> None:
         """Background thread: parse newline-delimited JSON messages."""
+        buf = self._recv_buf
         try:
             while True:
                 chunk = self.sock.recv(8192)
                 if not chunk:
                     LOG.warning("pool closed the connection")
                     return
-                self._recv_buf += chunk
-                while b"\n" in self._recv_buf:
-                    line, self._recv_buf = self._recv_buf.split(b"\n", 1)
+                buf += chunk
+                nl = buf.rfind(b"\n")
+                if nl < 0:
+                    continue
+                lines = bytes(buf[:nl])
+                del buf[: nl + 1]
+                for line in lines.split(b"\n"):
                     if line := line.strip():
-                        self._dispatch(json.loads(line.decode()))
+                        self._dispatch(json.loads(line))
         except (OSError, ValueError) as exc:
             LOG.warning("stopped reading from the pool: %s", exc)
 

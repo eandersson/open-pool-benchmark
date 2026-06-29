@@ -47,7 +47,7 @@ pools:
   pogolo:
     description: 0xf0xx0/pogolo (Go solo pool)
     source: image
-    image: 0xf0xx0/pogolo:latest
+    image: 0xf0xx0/pogolo:testing
     stratum_port: 5661
     api_port: 5662
     config:

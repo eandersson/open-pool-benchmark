@@ -27,6 +27,7 @@ def rpc_call(url: str, auth: str, method: str, params: list):
 class Client:
     def __init__(self):
         self.job_id = None
+        self.notify_ts = 0.0
         self.new_job = asyncio.Event()
 
     async def connect(self, host, port, address):
@@ -51,6 +52,7 @@ class Client:
             if message.get("method") == "mining.notify":
                 job_id = message["params"][0]
                 if job_id != self.job_id:
+                    self.notify_ts = time.perf_counter()
                     self.job_id = job_id
                     self.new_job.set()
 
@@ -87,7 +89,7 @@ async def main() -> None:
             await asyncio.wait_for(c.new_job.wait(), 10)
         except asyncio.TimeoutError:
             continue
-        lats.append((time.perf_counter() - t0) * 1000.0)
+        lats.append((c.notify_ts - t0) * 1000.0)
     if lats:
         lats.sort()
         n = len(lats)

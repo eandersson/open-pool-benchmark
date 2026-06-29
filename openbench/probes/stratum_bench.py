@@ -60,6 +60,7 @@ class Client:
         self.job_id = self.ntime_hex = None
         self.auth_ok = False
         self._mid = self._tail = None
+        self._submit_tpl = b""
         self._net_target = 0
         self._nonce = 0
         self._id = 10
@@ -101,6 +102,11 @@ class Client:
         self._tail = prefix[64:] + struct.pack("<I", int(ntime, 16)) + struct.pack("<I", int(nbits, 16))
         self._net_target = _bits_to_target(nbits)
         self.job_id, self.ntime_hex = job_id, ntime
+        self._submit_tpl = (
+            ',"method":"mining.submit","params":['
+            + json.dumps(self.address) + "," + json.dumps(job_id) + ","
+            + json.dumps(extranonce2) + "," + json.dumps(ntime) + ',"'
+        ).encode()
         self._has_job.set()
 
     def _next_above_target_nonce(self) -> int:
@@ -116,6 +122,7 @@ class Client:
         try:
             while not self.stop_evt.is_set():
                 line = await self._r.readline()
+                recv_ts = time.perf_counter()
                 if not line:
                     break
                 try:
@@ -125,11 +132,11 @@ class Client:
                 if message.get("method") == "mining.notify":
                     self._prepare(message["params"])
                 elif message.get("method") is None:
-                    self._on_response(message)
+                    self._on_response(message, recv_ts)
         except (OSError, asyncio.IncompleteReadError):
             pass
 
-    def _on_response(self, message: dict) -> None:
+    def _on_response(self, message: dict, recv_ts: float) -> None:
         mid = message.get("id")
         if mid == 1:
             result = message.get("result") or []
@@ -144,7 +151,7 @@ class Client:
             t0 = self._pending.pop(mid)
             self._sem.release()
             if self.measuring:
-                self.lats.append((time.perf_counter() - t0) * 1000.0)
+                self.lats.append((recv_ts - t0) * 1000.0)
                 self.submits += 1
                 if message.get("result") is True:
                     self.accepts += 1
@@ -153,12 +160,8 @@ class Client:
 
     async def flood(self, go_evt: asyncio.Event) -> None:
         await go_evt.wait()
-        extranonce2 = "00" * self.extranonce2_size
         while not self.stop_evt.is_set():
-            try:
-                await asyncio.wait_for(self._sem.acquire(), 1.0)
-            except asyncio.TimeoutError:
-                continue
+            await self._sem.acquire()
             if self.stop_evt.is_set():
                 self._sem.release()
                 return
@@ -167,9 +170,7 @@ class Client:
             self._id += 1
             self._pending[mid] = time.perf_counter()
             try:
-                self._send({"id": mid, "method": "mining.submit",
-                            "params": [self.address, self.job_id, extranonce2, self.ntime_hex,
-                                       "%08x" % nonce]})
+                self._w.write(b'{"id":%d' % mid + self._submit_tpl + b'%08x"]}\n' % nonce)
                 await self._w.drain()
             except OSError:
                 self.errors += 1
