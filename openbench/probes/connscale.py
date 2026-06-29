@@ -6,8 +6,9 @@ cost of a connection. Opens in batches to respect the listen backlog. stdlib onl
 """
 import argparse
 import asyncio
-import json
 import time
+
+from _stratum import DECODER, frame
 
 ESTABLISHED = 0
 FAILED = 0
@@ -21,10 +22,8 @@ async def one_conn(host: str, port: int, address: str, stop: asyncio.Event) -> N
         FAILED += 1
         return
     try:
-        writer.write((json.dumps({"id": 1, "method": "mining.subscribe",
-                                  "params": ["connscale/1.0"]}) + "\n").encode())
-        writer.write((json.dumps({"id": 2, "method": "mining.authorize",
-                                  "params": [address, "x"]}) + "\n").encode())
+        writer.write(frame({"id": 1, "method": "mining.subscribe", "params": ["connscale/1.0"]}))
+        writer.write(frame({"id": 2, "method": "mining.authorize", "params": [address, "x"]}))
         await writer.drain()
         while True:
             line = await asyncio.wait_for(reader.readline(), 30)
@@ -32,10 +31,10 @@ async def one_conn(host: str, port: int, address: str, stop: asyncio.Event) -> N
                 FAILED += 1
                 return
             try:
-                message = json.loads(line)
+                message = DECODER.decode(line)
             except ValueError:
                 continue
-            if message.get("id") == 2:
+            if message.id == 2:
                 break
         ESTABLISHED += 1
         await stop.wait()

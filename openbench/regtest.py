@@ -7,11 +7,12 @@ the container.
 
 from __future__ import annotations
 
-import json
 import logging
 import pathlib
 import time
 from typing import Any
+
+import msgspec
 
 from openbench import config
 from openbench import docker
@@ -138,7 +139,7 @@ class Backend:
         while paying the wrong address, which only inspecting the coinbase catches.
         """
         block_hash = self._cli("getblockhash", height).strip()
-        block = json.loads(self._cli("getblock", block_hash, 2))
+        block = msgspec.json.decode(self._cli("getblock", block_hash, 2))
         addresses, sig = self._coinbase_info(block)
         return address in addresses, tag.encode().hex() in sig.lower()
 

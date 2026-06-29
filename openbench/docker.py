@@ -31,7 +31,8 @@ import time
 LOG = logging.getLogger(__name__)
 
 DOCKER = "docker"
-PROBE_IMAGE = os.environ.get("OPENBENCH_PROBE_IMAGE", "python:3.14-slim")
+_DEFAULT_PROBE_IMAGE = "openbench-probes:latest"
+PROBE_IMAGE = os.environ.get("OPENBENCH_PROBE_IMAGE", _DEFAULT_PROBE_IMAGE)
 _STATS_FORMAT = "{{.CPUPerc}}|{{.MemUsage}}"
 _SAMPLE_INTERVAL_SECONDS = 1.0
 _RESPONSIVE_POLL_SECONDS = 0.1
@@ -175,6 +176,17 @@ def build(tag: str, context: str | pathlib.Path, dockerfile: str | None = None) 
         args += ["-f", str(pathlib.Path(dockerfile))]
     args.append(str(pathlib.Path(context).resolve()))
     _run(args)
+
+
+def ensure_probe_image(probes_dir: pathlib.Path) -> None:
+    """Build the probe/miner runtime image (python:slim + msgspec) once, if it's missing.
+
+    The stdlib probes and the bind-mounted test miner run in this image; it only adds msgspec to a
+    stock slim base. An `OPENBENCH_PROBE_IMAGE` override is treated as caller-managed (never built).
+    """
+    if PROBE_IMAGE != _DEFAULT_PROBE_IMAGE or image_exists(PROBE_IMAGE):
+        return
+    build(PROBE_IMAGE, probes_dir, str(probes_dir / "Dockerfile"))
 
 
 def run_detached(

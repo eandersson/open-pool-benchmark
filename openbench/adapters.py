@@ -9,7 +9,6 @@ it on the regtest network pinned to its cores, wait for readiness, and tear it d
 
 from __future__ import annotations
 
-import json
 import logging
 import pathlib
 import re
@@ -17,6 +16,7 @@ import subprocess
 import tomllib
 from typing import TYPE_CHECKING
 
+import msgspec
 import yaml
 
 from openbench import config
@@ -91,8 +91,8 @@ def _validate_rendered(text: str, fmt: str) -> None:
             raise AdapterError(f"rendered config is not valid TOML: {exc}") from exc
     elif fmt == "json":
         try:
-            json.loads(text)
-        except json.JSONDecodeError as exc:
+            msgspec.json.decode(text)
+        except msgspec.DecodeError as exc:
             raise AdapterError(f"rendered config is not valid JSON: {exc}") from exc
     elif fmt == "yaml":
         try:

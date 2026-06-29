@@ -20,10 +20,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
-import json
 import random
 import struct
 import time
+
+from _stratum import DECODER, StratumMessage, encode, frame
 
 
 def _dsha(b: bytes) -> bytes:
@@ -70,7 +71,7 @@ class Client:
         self.lats: list[float] = []
 
     def _send(self, obj: dict) -> None:
-        self._w.write((json.dumps(obj) + "\n").encode())
+        self._w.write(frame(obj))
 
     async def connect(self) -> None:
         self._r, self._w = await asyncio.open_connection(self.host, self.port)
@@ -103,10 +104,10 @@ class Client:
         self._net_target = _bits_to_target(nbits)
         self.job_id, self.ntime_hex = job_id, ntime
         self._submit_tpl = (
-            ',"method":"mining.submit","params":['
-            + json.dumps(self.address) + "," + json.dumps(job_id) + ","
-            + json.dumps(extranonce2) + "," + json.dumps(ntime) + ',"'
-        ).encode()
+            b',"method":"mining.submit","params":['
+            + encode(self.address) + b"," + encode(job_id) + b","
+            + encode(extranonce2) + b"," + encode(ntime) + b',"'
+        )
         self._has_job.set()
 
     def _next_above_target_nonce(self) -> int:
@@ -126,26 +127,26 @@ class Client:
                 if not line:
                     break
                 try:
-                    message = json.loads(line)
+                    message = DECODER.decode(line)
                 except ValueError:
                     continue
-                if message.get("method") == "mining.notify":
-                    self._prepare(message["params"])
-                elif message.get("method") is None:
+                if message.method == "mining.notify":
+                    self._prepare(message.params)
+                elif message.method is None:
                     self._on_response(message, recv_ts)
         except (OSError, asyncio.IncompleteReadError):
             pass
 
-    def _on_response(self, message: dict, recv_ts: float) -> None:
-        mid = message.get("id")
+    def _on_response(self, message: StratumMessage, recv_ts: float) -> None:
+        mid = message.id
         if mid == 1:
-            result = message.get("result") or []
+            result = message.result or []
             if len(result) >= 3:
                 self.extranonce1 = result[1]
                 self.extranonce2_size = int(result[2])
             self._subscribed.set()
         elif mid == 2:
-            self.auth_ok = message.get("result") is True
+            self.auth_ok = message.result is True
             self._authorized.set()
         elif mid in self._pending:
             t0 = self._pending.pop(mid)
@@ -153,7 +154,7 @@ class Client:
             if self.measuring:
                 self.lats.append((recv_ts - t0) * 1000.0)
                 self.submits += 1
-                if message.get("result") is True:
+                if message.result is True:
                     self.accepts += 1
                 else:
                     self.rejects += 1
@@ -233,7 +234,7 @@ def _worker(args, n_conn, barrier, q):
 def _emit(merged: dict, args, workers: int) -> None:
     lats = sorted(merged["lats"])
     elapsed = merged["elapsed"] or 1.0
-    print(json.dumps({
+    print(encode({
         "connections": args.connections,
         "workers": workers,
         "pipeline": args.pipeline,
@@ -245,7 +246,7 @@ def _emit(merged: dict, args, workers: int) -> None:
         "validated_per_sec": round(merged["submits"] / elapsed, 1),
         "latency_ms": {"p50": _pct(lats, 0.50), "p95": _pct(lats, 0.95),
                        "p99": _pct(lats, 0.99), "max": round(lats[-1], 4) if lats else 0.0},
-    }))
+    }).decode())
 
 
 def main() -> int:

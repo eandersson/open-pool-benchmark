@@ -9,10 +9,11 @@ connections before we reach the ceiling. stdlib only.
   python3 conn_probe.py <host> <port> <address> [safety_cap]
 """
 import errno
-import json
 import socket
 import sys
 import time
+
+from _stratum import frame
 
 
 def main() -> int:
@@ -46,10 +47,8 @@ def main() -> int:
             sock.close()
             break
         try:
-            sock.sendall(json.dumps({"id": 1, "method": "mining.subscribe",
-                                     "params": ["conntest/1.0"]}).encode() + b"\n")
-            sock.sendall(json.dumps({"id": 2, "method": "mining.authorize",
-                                     "params": [address, "x"]}).encode() + b"\n")
+            sock.sendall(frame({"id": 1, "method": "mining.subscribe", "params": ["conntest/1.0"]}))
+            sock.sendall(frame({"id": 2, "method": "mining.authorize", "params": [address, "x"]}))
             buf = b""
             while b"result" not in buf and b"method" not in buf:
                 chunk = sock.recv(4096)

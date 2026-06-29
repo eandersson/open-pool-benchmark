@@ -9,13 +9,14 @@ assets and works offline straight from disk.
 from __future__ import annotations
 
 import datetime
-import json
 import logging
 import os
 import pathlib
 import re
 from collections.abc import Sequence
 from typing import Any
+
+import msgspec
 
 LOG = logging.getLogger(__name__)
 
@@ -69,7 +70,7 @@ def write_run(out_dir: str | pathlib.Path, payload: dict[str, Any]) -> pathlib.P
     while path.exists():
         path = out / f"{base}-{suffix}.json"
         suffix += 1
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    path.write_bytes(msgspec.json.format(msgspec.json.encode(payload), indent=2))
     return path
 
 
@@ -81,8 +82,8 @@ def load_runs(out_dir: str | pathlib.Path) -> list[dict[str, Any]]:
         if path.name == "data.json":
             continue
         try:
-            runs.append(json.loads(path.read_text(encoding="utf-8")))
-        except (OSError, json.JSONDecodeError) as exc:
+            runs.append(msgspec.json.decode(path.read_bytes()))
+        except (OSError, msgspec.DecodeError) as exc:
             LOG.warning("skipping unreadable run %s: %s", path, exc)
     runs.sort(key=lambda run: (str(run.get("timestamp", "")), str(run.get("label", ""))))
     return runs
@@ -96,7 +97,7 @@ def write_report(out_dir: str | pathlib.Path) -> pathlib.Path:
     html = render_report(runs)
     report_path = out / _REPORT_NAME
     report_path.write_text(html, encoding="utf-8")
-    (out / "data.json").write_text(json.dumps(runs, indent=2), encoding="utf-8")
+    (out / "data.json").write_bytes(msgspec.json.format(msgspec.json.encode(runs), indent=2))
     return report_path
 
 
@@ -111,7 +112,7 @@ def render_report(runs: list[dict[str, Any]]) -> str:
         ),
         None,
     )
-    data = json.dumps({"runs": runs, "generated": generated, "cpus": cpus})
+    data = msgspec.json.encode({"runs": runs, "generated": generated, "cpus": cpus}).decode()
     data = data.replace("</", "<\\/")
     shell = _HTML_TEMPLATE.replace("/*GENERATED*/", generated).replace(
         "/*CPUS*/", str(cpus if cpus is not None else "?")

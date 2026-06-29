@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
-import json
 import logging
 import os
 import pathlib
@@ -21,6 +20,7 @@ from collections.abc import Iterator
 from collections.abc import Sequence
 from typing import Any
 
+import msgspec
 import yaml
 
 from openbench import adapters
@@ -87,6 +87,7 @@ def session(
     run = context.RunContext(registry=registry, backend=backend, scratch=scratch)
     try:
         backend.up()
+        docker.ensure_probe_image(registry.root / "openbench" / "probes")
         if mine_maturity:
             backend.mine_to_maturity()
         else:
@@ -126,8 +127,8 @@ def _run_bench_probe(
     if not lines:
         raise adapters.AdapterError("load generator produced no output")
     try:
-        result: dict[str, Any] = json.loads(lines[-1])
-    except json.JSONDecodeError as exc:
+        result: dict[str, Any] = msgspec.json.decode(lines[-1])
+    except msgspec.DecodeError as exc:
         raise adapters.AdapterError(
             f"load generator output was not JSON: {lines[-1][:200]!r}"
         ) from exc
@@ -252,7 +253,8 @@ def bench(
                 failed = True
     _emit(headers, rows, csv_path)
     if json_path:
-        pathlib.Path(json_path).write_text(json.dumps(records, indent=2), encoding="utf-8")
+        formatted = msgspec.json.format(msgspec.json.encode(records), indent=2)
+        pathlib.Path(json_path).write_bytes(formatted)
         LOG.info("wrote %s", json_path)
     _persist(
         out,
@@ -503,8 +505,8 @@ def _parse_audit_line(output: str) -> dict[str, Any]:
     for line in reversed(output.splitlines()):
         if line.startswith("AUDIT "):
             try:
-                parsed: dict[str, Any] = json.loads(line[len("AUDIT ") :])
-            except json.JSONDecodeError:
+                parsed: dict[str, Any] = msgspec.json.decode(line[len("AUDIT ") :])
+            except msgspec.DecodeError:
                 return {}
             return parsed
     return {}

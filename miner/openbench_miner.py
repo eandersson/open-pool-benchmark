@@ -16,7 +16,6 @@ USAGE
 
 import argparse
 import hashlib
-import json
 import logging
 import multiprocessing as mp
 import queue
@@ -25,8 +24,24 @@ import struct
 import sys
 import threading
 import time
+from typing import Any
+
+import msgspec
 
 type WorkerJob = dict[str, object]
+
+
+class _StratumMessage(msgspec.Struct):
+    """One decoded inbound line: a notification (method+params) or a response (id+result/error)."""
+
+    id: Any = None
+    method: str | None = None
+    params: Any = msgspec.field(default_factory=list)
+    result: Any = None
+    error: Any = None
+
+
+_STRATUM_DECODER = msgspec.json.Decoder(_StratumMessage)
 
 # Stratum pdiff-1 target: hash <= DIFF1_TARGET / D satisfies difficulty D.
 DIFF1_TARGET = 0xFFFF << 208
@@ -492,9 +507,7 @@ class StratumClient:
     def _send(self, method: str, params: list) -> int:
         message_id = self._next_id
         self._next_id += 1
-        line = json.dumps(
-            {"id": message_id, "method": method, "params": params}, separators=(",", ":")
-        ).encode() + b"\n"
+        line = msgspec.json.encode({"id": message_id, "method": method, "params": params}) + b"\n"
         with self._send_lock:
             self.sock.sendall(line)
         return message_id
@@ -538,20 +551,20 @@ class StratumClient:
                 del buf[: nl + 1]
                 for line in lines.split(b"\n"):
                     if line := line.strip():
-                        self._dispatch(json.loads(line))
-        except (OSError, ValueError) as exc:
+                        self._dispatch(_STRATUM_DECODER.decode(line))
+        except (OSError, ValueError, msgspec.MsgspecError) as exc:
             LOG.warning("stopped reading from the pool: %s", exc)
 
-    def _dispatch(self, message: dict) -> None:
-        if method := message.get("method"):
-            self._handle_notification(method, message.get("params", []))
+    def _dispatch(self, message: _StratumMessage) -> None:
+        if message.method:
+            self._handle_notification(message.method, message.params)
         else:
             self._handle_response(message)
 
-    def _handle_response(self, message: dict) -> None:
-        message_id = message.get("id")
-        result = message.get("result")
-        error = message.get("error")
+    def _handle_response(self, message: _StratumMessage) -> None:
+        message_id = message.id
+        result = message.result
+        error = message.error
 
         match message_id:
             case self._subscribe_id:
@@ -861,7 +874,7 @@ def run_miner(args: argparse.Namespace) -> int:
                 "connections": num_connections,
                 "blocks_submitted": sum(c.blocks_submitted for c in connections),
             }
-            print(f"AUDIT {json.dumps(summary)}", flush=True)
+            print(f"AUDIT {msgspec.json.encode(summary).decode()}", flush=True)
     return exit_code
 
 

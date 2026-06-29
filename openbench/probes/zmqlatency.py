@@ -10,18 +10,19 @@ and times until a mining.notify with a *new* job_id arrives.
 import argparse
 import asyncio
 import base64
-import json
 import time
 import urllib.request
 
+from _stratum import DECODER, decode, encode, frame
+
 
 def rpc_call(url: str, auth: str, method: str, params: list):
-    body = json.dumps({"jsonrpc": "1.0", "id": 1, "method": method, "params": params}).encode()
+    body = encode({"jsonrpc": "1.0", "id": 1, "method": method, "params": params})
     request = urllib.request.Request(
         url, data=body,
         headers={"Authorization": "Basic " + auth, "Content-Type": "application/json"})
     with urllib.request.urlopen(request, timeout=15) as response:
-        return json.loads(response.read())["result"]
+        return decode(response.read())["result"]
 
 
 class Client:
@@ -38,7 +39,7 @@ class Client:
         asyncio.create_task(self._read())
 
     def _send(self, obj):
-        self._w.write((json.dumps(obj) + "\n").encode())
+        self._w.write(frame(obj))
 
     async def _read(self):
         while True:
@@ -46,11 +47,11 @@ class Client:
             if not line:
                 return
             try:
-                message = json.loads(line)
+                message = DECODER.decode(line)
             except ValueError:
                 continue
-            if message.get("method") == "mining.notify":
-                job_id = message["params"][0]
+            if message.method == "mining.notify":
+                job_id = message.params[0]
                 if job_id != self.job_id:
                     self.notify_ts = time.perf_counter()
                     self.job_id = job_id
